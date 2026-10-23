@@ -2,6 +2,17 @@ import express, { Request, Response } from 'express';
 import { config } from './config';
 import { getOfficeGroupChatId, getTodayDateString } from './supabase';
 
+export const recentEvents: Array<{ time: string; type: string; details: any }> = [];
+
+export function logEvent(type: string, details: any) {
+  recentEvents.unshift({
+    time: new Date().toISOString(),
+    type,
+    details,
+  });
+  if (recentEvents.length > 30) recentEvents.pop();
+}
+
 export const app = express();
 app.use(express.json());
 
@@ -33,6 +44,16 @@ app.get('/health', (_req: Request, res: Response) => {
     status: 'ok',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
+  });
+});
+
+// Endpoint de diagnóstico para depuração em tempo real
+app.get('/debug', async (_req: Request, res: Response) => {
+  const officeGroupChatId = await getOfficeGroupChatId();
+  res.json({
+    officeGroupChatId,
+    officeGroupConfigured: Boolean(officeGroupChatId),
+    recentEvents,
   });
 });
 

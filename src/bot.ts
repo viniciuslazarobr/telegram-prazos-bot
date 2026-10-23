@@ -19,9 +19,25 @@ import {
 } from './supabase';
 import { parseDeadlineFromText, parseDeadlineFromAudio } from './ai';
 import { executeDeadlineCheck, getUrgencyBadge } from './cron';
+import { logEvent } from './server';
 
 // Criação da instância do Bot
 export const bot = new Bot(config.telegramBotToken);
+
+/**
+ * Middleware para registrar e diagnosticar eventos recebidos
+ */
+bot.use(async (ctx, next) => {
+  const textPreview = ctx.message?.text || ctx.callbackQuery?.data || (ctx.message?.voice ? '[Audio]' : undefined);
+  logEvent('telegram_update', {
+    chatType: ctx.chat?.type,
+    chatId: ctx.chat?.id,
+    from: ctx.from?.first_name,
+    fromId: ctx.from?.id,
+    text: textPreview,
+  });
+  await next();
+});
 
 /**
  * Escapa caracteres reservados do Markdown do Telegram para evitar erros de parsing (400 Bad Request)
@@ -55,7 +71,6 @@ async function ensureUserRegistered(ctx: any): Promise<{ id: string; name: strin
     return { id: userId, name: saved.name };
   } catch (err: any) {
     console.warn(`[ensureUserRegistered] Aviso: Banco de dados inacessível ou tabelas não criadas (${err.message})`);
-    // Retorna identificação básica sem travar o bot
     return { id: userId, name: fullName };
   }
 }
@@ -103,6 +118,30 @@ async function notifyOfficeGroupCompleted(proc: Process, completedByName: string
     console.error('[BOT] Falha ao enviar aviso de conclusão no Grupo Geral:', err?.message || err);
   }
 }
+
+// ==========================================
+// AUTO-VINCULAÇÃO QUANDO O BOT É ADICIONADO AO GRUPO
+// ==========================================
+
+bot.on('my_chat_member', async (ctx) => {
+  const status = ctx.myChatMember.new_chat_member.status;
+  const chatType = ctx.chat.type;
+
+  if ((chatType === 'group' || chatType === 'supergroup') && (status === 'member' || status === 'administrator')) {
+    const chatId = String(ctx.chat.id);
+    await setOfficeGroupChatId(chatId);
+    try {
+      await ctx.api.sendMessage(
+        chatId,
+        `✅ *Painel do Escritório Vinculado Automaticamente!*\n\n` +
+        `Este grupo agora é o canal oficial de alertas e lembretes da equipe. Todos os prazos cadastrados e concluídos aparecerão aqui.`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (e) {
+      // Ignora erro se não puder mandar mensagem de início
+    }
+  }
+});
 
 // ==========================================
 // COMANDOS DO BOT
@@ -172,14 +211,16 @@ bot.command('nome', async (ctx) => {
 });
 
 /**
- * /definir_grupo: Vincula o chat de grupo atual como Painel Geral do Escritório
+ * /definir_grupo (e atalhos /definir, /grupo_oficial): Vincula o chat de grupo atual como Painel Geral
  */
-bot.command('definir_grupo', async (ctx) => {
+bot.command(['definir_grupo', 'definir', 'grupo_oficial'], async (ctx) => {
   const chatType = ctx.chat?.type;
   if (chatType !== 'group' && chatType !== 'supergroup') {
-    return ctx.reply('⚠️ Este comando deve ser executado **dentro do Grupo do Telegram do Escritório**, onde estão os membros da equipe.', {
-      parse_mode: 'Markdown',
-    });
+    return ctx.reply(
+      '⚠️ Este comando deve ser executado **dentro do Grupo do Telegram do Escritório**.\n\n' +
+      '💡 *Dica alternativa:* Você também pode simplesmente **encaminhar qualquer mensagem do grupo aqui para mim no privado**, que eu vinculo o grupo automaticamente!',
+      { parse_mode: 'Markdown' }
+    );
   }
 
   const chatId = String(ctx.chat.id);
@@ -206,7 +247,7 @@ bot.command('grupo', async (ctx) => {
     });
   } else {
     await ctx.reply(
-      `⚠️ Nenhum Grupo Geral configurado ainda. Adicione o bot ao grupo do escritório e digite \`/definir_grupo\`.`,
+      `⚠️ Nenhum Grupo Geral configurado ainda. Adicione o bot ao grupo do escritório e digite \`/definir_grupo\` ou encaminhe uma mensagem do grupo aqui.`,
       { parse_mode: 'Markdown' }
     );
   }
@@ -595,19 +636,50 @@ bot.on(['message:voice', 'message:audio'], async (ctx) => {
 });
 
 // ==========================================
-// CAPTURA DE TEXTO LIVRE / LINGUAGEM NATURAL
+// CAPTURA DE TEXTO LIVRE / LINGUAGEM NATURAL E ENCAMINHAMENTOS
 // ==========================================
 
 bot.on('message:text', async (ctx) => {
   const text = ctx.message.text.trim();
+  const isPrivate = ctx.chat.type === 'private';
+  const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
 
-  // Ignora mensagens que comecem com barra (comandos)
+  // 1. SUPORTE A MENSAGEM ENCAMINHADA DO GRUPO PARA VINCULAÇÃO IMEDIATA
+  const forwardFromChat = (ctx.message as any).forward_from_chat;
+  const forwardOrigin = (ctx.message as any).forward_origin;
+  const forwardedChat = forwardFromChat || (forwardOrigin && forwardOrigin.type === 'chat' ? forwardOrigin.chat : null);
+
+  if (isPrivate && forwardedChat && (forwardedChat.type === 'group' || forwardedChat.type === 'supergroup')) {
+    const targetChatId = String(forwardedChat.id);
+    await setOfficeGroupChatId(targetChatId);
+    return ctx.reply(
+      `✅ *Grupo do Escritório Vinculado com Sucesso!*\n\n` +
+      `Detectei que você encaminhou uma mensagem do grupo *${escapeMarkdown(forwardedChat.title || 'Escritório')}* (ID: \`${targetChatId}\`).\n` +
+      `Ele agora está oficialmente registrado como o Painel Geral do Escritório! 🎉`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  // 2. SUPORTE A DEFINIR GRUPO POR TEXTO LIVRE NO GRUPO
+  if (isGroup) {
+    const lower = text.toLowerCase();
+    if (lower.includes('definir_grupo') || lower.includes('definir grupo') || lower.includes('vincular grupo')) {
+      const chatId = String(ctx.chat.id);
+      await setOfficeGroupChatId(chatId);
+      return ctx.reply(
+        `✅ *Este grupo agora é o Painel Geral Oficial do Escritório!*\n\n` +
+        `📢 A partir de agora, todos os novos cadastros, baixas e o Painel do Dia às 08:30 serão enviados aqui para toda a equipe acompanhar.`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+  }
+
+  // Ignora outras mensagens que comecem com barra (outros comandos já tratados)
   if (text.startsWith('/')) return;
 
-  const isPrivate = ctx.chat.type === 'private';
   const startsWithPrazo = text.toLowerCase().startsWith('prazo:') || text.toLowerCase().startsWith('prazo');
 
-  // Só processa se for no privado ou se no grupo começar com "prazo"
+  // Só processa prazo se for no privado ou se no grupo começar com "prazo"
   if (!isPrivate && !startsWithPrazo) {
     return;
   }
