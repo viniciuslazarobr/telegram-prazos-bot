@@ -1,0 +1,646 @@
+import { Bot, InlineKeyboard } from 'grammy';
+import { config } from './config';
+import {
+  upsertTeamMember,
+  updateTeamMemberName,
+  getTeamMember,
+  getOfficeGroupChatId,
+  setOfficeGroupChatId,
+  createProcess,
+  getMyPendingProcesses,
+  getAllPendingProcesses,
+  getProcessById,
+  completeProcess,
+  cancelProcess,
+  formatDateBR,
+  parseDateBRToISO,
+  calculateDaysRemaining,
+  Process,
+} from './supabase';
+import { parseDeadlineFromText, parseDeadlineFromAudio } from './ai';
+import { executeDeadlineCheck, getUrgencyBadge } from './cron';
+
+// Criação da instância do Bot
+export const bot = new Bot(config.telegramBotToken);
+
+/**
+ * Garante que o usuário que enviou a mensagem está registrado no Supabase
+ */
+async function ensureUserRegistered(ctx: any): Promise<{ id: string; name: string }> {
+  const from = ctx.from;
+  if (!from) {
+    return { id: '0', name: 'Usuário Desconhecido' };
+  }
+
+  const userId = String(from.id);
+  const fullName = [from.first_name, from.last_name].filter(Boolean).join(' ') || from.username || `Usuário ${userId}`;
+
+  // Busca se já existe cadastro com nome customizado
+  const existing = await getTeamMember(userId);
+  if (existing) {
+    return { id: userId, name: existing.name };
+  }
+
+  // Se não existir, cadastra automaticamente
+  const saved = await upsertTeamMember(userId, fullName, from.username || null);
+  return { id: userId, name: saved.name };
+}
+
+/**
+ * Envia notificação imediata no Grupo Geral do Escritório sobre novos cadastros
+ */
+async function notifyOfficeGroupNewProcess(proc: Process, creatorName: string): Promise<void> {
+  const officeGroupChatId = await getOfficeGroupChatId();
+  if (!officeGroupChatId) return;
+
+  const msg =
+    `📢 *${creatorName} cadastrou um novo prazo:*\n\n` +
+    `📂 *Processo:* \`${proc.process_number}\`\n` +
+    `👤 *Cliente:* *${proc.client_name}*\n` +
+    `⏳ *Prazo:* _${proc.deadline_info}_\n` +
+    `📅 *Vencimento:* *${formatDateBR(proc.due_date)}*\n` +
+    `🔔 *Avisos:* ${proc.remind_days_before} dias antes\n` +
+    `📌 *Responsável:* ${proc.owner_name}`;
+
+  try {
+    await bot.api.sendMessage(officeGroupChatId, msg, { parse_mode: 'Markdown' });
+  } catch (err: any) {
+    console.error('[BOT] Falha ao enviar notificação de novo prazo no Grupo Geral:', err?.message || err);
+  }
+}
+
+/**
+ * Envia notificação imediata no Grupo Geral do Escritório sobre prazos concluídos
+ */
+async function notifyOfficeGroupCompleted(proc: Process, completedByName: string): Promise<void> {
+  const officeGroupChatId = await getOfficeGroupChatId();
+  if (!officeGroupChatId) return;
+
+  const msg =
+    `✅ *${completedByName}* concluiu o prazo do Processo \`${proc.process_number}\`!\n\n` +
+    `👤 *Cliente:* ${proc.client_name}\n` +
+    `⏳ *Prazo:* ${proc.deadline_info}\n` +
+    `📅 *Vencimento original:* ${formatDateBR(proc.due_date)}\n` +
+    `🎉 _Lembretes automáticos deste prazo foram encerrados._`;
+
+  try {
+    await bot.api.sendMessage(officeGroupChatId, msg, { parse_mode: 'Markdown' });
+  } catch (err: any) {
+    console.error('[BOT] Falha ao enviar aviso de conclusão no Grupo Geral:', err?.message || err);
+  }
+}
+
+// ==========================================
+// COMANDOS DO BOT
+// ==========================================
+
+/**
+ * /start: Registro e apresentação do Bot
+ */
+bot.command('start', async (ctx) => {
+  const user = await ensureUserRegistered(ctx);
+
+  const welcome =
+    `⚖️ *Bem-vindo(a) ao Bot de Prazos do Escritório!*\n\n` +
+    `Olá, *${user.name}*! Seu usuário já está vinculado ao sistema.\n\n` +
+    `📌 *Como funciona:*\n` +
+    `1. Cada membro da equipe cadastra seus prazos por *áudio*, *texto livre* ou comando.\n` +
+    `2. Nos horários de cobrança (08:30, 14:00 e 17:00), o Bot manda uma notificação privada para você com botão de dar baixa.\n` +
+    `3. O *Grupo Geral do Escritório* recebe o resumo diário da equipe e avisos sempre que alguém cadastrar ou concluir um prazo.\n\n` +
+    `🛠️ *Comandos Principais:*\n` +
+    `• \`/meus\` - Ver seus prazos pendentes\n` +
+    `• \`/geral\` - Ver os prazos de todos os 3 membros da equipe\n` +
+    `• \`/hoje\` - Ver prazos de hoje, amanhã ou atrasados\n` +
+    `• \`/novo [Nº] | [Cliente] | [Prazo] | [DD/MM/AAAA]\` - Cadastrar prazo\n` +
+    `• \`/nome [Seu Apelido]\` - Mudar seu nome de exibição\n` +
+    `• \`/definir_grupo\` - Definir o grupo atual como Painel do Escritório\n` +
+    `• \`/teste_alerta\` - Disparar teste imediato dos lembretes\n` +
+    `• \`/ajuda\` - Manual completo de uso\n\n` +
+    `💡 *Dica:* Você pode simplesmente enviar um *áudio de voz* ou escrever: _"Processo 12345 do cliente Silva, contestação vence 15/11"_ que eu cadastro automaticamente!`;
+
+  await ctx.reply(welcome, { parse_mode: 'Markdown' });
+});
+
+/**
+ * /nome [Apelido]: Altera o nome de exibição do membro
+ */
+bot.command('nome', async (ctx) => {
+  const args = ctx.match?.trim();
+  if (!args) {
+    return ctx.reply(
+      '⚠️ Por favor, informe seu apelido/nome após o comando.\nExemplo: `/nome Irmão` ou `/nome Dr. Chefe`',
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  const userId = String(ctx.from?.id);
+  try {
+    const updated = await updateTeamMemberName(userId, args);
+    await ctx.reply(
+      `✅ Seu nome de exibição foi atualizado para: *${updated.name}*!\nEle será usado nas listagens e notificações da equipe.`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (err: any) {
+    await ctx.reply(`❌ Erro ao atualizar nome: ${err.message}`);
+  }
+});
+
+/**
+ * /definir_grupo: Vincula o chat de grupo atual como Painel Geral do Escritório
+ */
+bot.command('definir_grupo', async (ctx) => {
+  const chatType = ctx.chat?.type;
+  if (chatType !== 'group' && chatType !== 'supergroup') {
+    return ctx.reply('⚠️ Este comando deve ser executado **dentro do Grupo do Telegram do Escritório**, onde estão os membros da equipe.', {
+      parse_mode: 'Markdown',
+    });
+  }
+
+  const chatId = String(ctx.chat.id);
+  try {
+    await setOfficeGroupChatId(chatId);
+    await ctx.reply(
+      `✅ *Este grupo agora é o Painel Geral Oficial do Escritório!*\n\n` +
+      `📢 A partir de agora, todos os novos cadastros, baixas e o Painel do Dia às 08:30 serão enviados aqui para toda a equipe acompanhar.`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (err: any) {
+    await ctx.reply(`❌ Erro ao salvar grupo: ${err.message}`);
+  }
+});
+
+/**
+ * /grupo: Exibe o status da vinculação do grupo
+ */
+bot.command('grupo', async (ctx) => {
+  const currentGroupId = await getOfficeGroupChatId();
+  if (currentGroupId) {
+    await ctx.reply(`ℹ️ O Grupo Geral do Escritório está configurado (Chat ID: \`${currentGroupId}\`).`, {
+      parse_mode: 'Markdown',
+    });
+  } else {
+    await ctx.reply(
+      `⚠️ Nenhum Grupo Geral configurado ainda. Adicione o bot ao grupo do escritório e digite \`/definir_grupo\`.`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+});
+
+/**
+ * /novo [Nº] | [Cliente] | [Prazo] | [DD/MM/AAAA] [| Dias]
+ */
+bot.command('novo', async (ctx) => {
+  const input = ctx.match?.trim();
+  if (!input) {
+    return ctx.reply(
+      `⚠️ *Formato inválido!*\nUse:\n\`/novo [Nº Processo] | [Nome do Cliente] | [Prazo] | [DD/MM/AAAA]\`\n\n` +
+      `*Exemplo:*\n\`/novo 0012345-67.2024.8.26.0100 | Banco do Brasil | Contestação | 15/11/2026\``,
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  const parts = input.split('|').map((s) => s.trim());
+  if (parts.length < 4) {
+    return ctx.reply(
+      `⚠️ São necessários pelo menos 4 campos separados por barra vertical \`|\`:\n` +
+      `\`/novo [Nº Processo] | [Nome do Cliente] | [Prazo] | [DD/MM/AAAA]\``,
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  const [processNumber, clientName, deadlineInfo, dateRaw, daysRaw] = parts;
+  const isoDate = parseDateBRToISO(dateRaw);
+  if (!isoDate) {
+    return ctx.reply(
+      `⚠️ Data inválida: *${dateRaw}*.\nPor favor, utilize o formato *DD/MM/AAAA* (ex: 25/11/2026).`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  const remindDays = daysRaw ? parseInt(daysRaw, 10) : 3;
+  const user = await ensureUserRegistered(ctx);
+
+  try {
+    const process = await createProcess({
+      process_number: processNumber,
+      client_name: clientName,
+      deadline_info: deadlineInfo,
+      owner_telegram_id: user.id,
+      owner_name: user.name,
+      due_date: isoDate,
+      remind_days_before: isNaN(remindDays) ? 3 : remindDays,
+    });
+
+    const keyboard = new InlineKeyboard()
+      .text('✅ Concluir Prazo', `done:${process.id}`)
+      .text('🗑️ Excluir', `delete:${process.id}`);
+
+    await ctx.reply(
+      `✅ *Prazo Cadastrado com Sucesso!*\n\n` +
+      `📂 *Processo:* \`${process.process_number}\`\n` +
+      `👤 *Cliente:* ${process.client_name}\n` +
+      `⏳ *Prazo:* ${process.deadline_info}\n` +
+      `📅 *Vencimento:* ${formatDateBR(process.due_date)}\n` +
+      `🔔 *Avisar com:* ${process.remind_days_before} dias de antecedência\n` +
+      `📌 *Responsável:* ${process.owner_name}`,
+      { parse_mode: 'Markdown', reply_markup: keyboard }
+    );
+
+    // Notifica o grupo geral
+    await notifyOfficeGroupNewProcess(process, user.name);
+  } catch (err: any) {
+    await ctx.reply(`❌ Erro ao cadastrar prazo: ${err.message}`);
+  }
+});
+
+/**
+ * /meus: Lista os prazos pendentes do usuário atual
+ */
+bot.command('meus', async (ctx) => {
+  const user = await ensureUserRegistered(ctx);
+  const myProcesses = await getMyPendingProcesses(user.id);
+
+  if (myProcesses.length === 0) {
+    return ctx.reply(`🎉 *Parabéns, ${user.name}!*\nVocê não possui nenhum prazo pendente no momento.`, {
+      parse_mode: 'Markdown',
+    });
+  }
+
+  let text = `📋 *SEUS PRAZOS PENDENTES (${myProcesses.length}):*\n\n`;
+
+  for (const proc of myProcesses) {
+    const daysRemaining = calculateDaysRemaining(proc.due_date);
+    const badge = getUrgencyBadge(daysRemaining);
+
+    text +=
+      `${badge.emoji} *[${badge.tag}]* Proc: \`${proc.process_number}\`\n` +
+      `👤 Cliente: *${proc.client_name}*\n` +
+      `⏳ Prazo: _${proc.deadline_info}_\n` +
+      `📅 Vencimento: *${formatDateBR(proc.due_date)}* (${badge.label})\n\n`;
+  }
+
+  // Cria botões inline para conclusão rápida de cada prazo
+  const keyboard = new InlineKeyboard();
+  myProcesses.forEach((proc, idx) => {
+    keyboard.text(`✅ Concluir #${proc.id}`, `done:${proc.id}`);
+    if ((idx + 1) % 2 === 0) keyboard.row();
+  });
+
+  await ctx.reply(text, { parse_mode: 'Markdown', reply_markup: keyboard });
+});
+
+/**
+ * /geral: Lista todos os prazos pendentes do escritório agrupados por membro
+ */
+bot.command('geral', async (ctx) => {
+  const allProcesses = await getAllPendingProcesses();
+
+  if (allProcesses.length === 0) {
+    return ctx.reply('🎉 *O escritório está 100% em dia!*\nNenhum prazo pendente cadastrado.', {
+      parse_mode: 'Markdown',
+    });
+  }
+
+  // Agrupa por responsável
+  const grouped = new Map<string, Process[]>();
+  for (const proc of allProcesses) {
+    const owner = proc.owner_name || 'Sem Responsável';
+    if (!grouped.has(owner)) {
+      grouped.set(owner, []);
+    }
+    grouped.get(owner)!.push(proc);
+  }
+
+  let text = `📊 *PAINEL GERAL DO ESCRITÓRIO - PRAZOS PENDENTES (${allProcesses.length})*\n\n`;
+
+  for (const [ownerName, procs] of grouped.entries()) {
+    text += `👤 *${ownerName}* (${procs.length} prazo${procs.length > 1 ? 's' : ''}):\n`;
+    for (const p of procs) {
+      const daysRemaining = calculateDaysRemaining(p.due_date);
+      const badge = getUrgencyBadge(daysRemaining);
+      text +=
+        `  ${badge.emoji} \`${p.process_number}\` | *${p.client_name}*\n` +
+        `     ↳ _${p.deadline_info}_ (Vence: *${formatDateBR(p.due_date)}* [${badge.tag}])\n`;
+    }
+    text += '\n';
+  }
+
+  text += `_Dica: Cada responsável pode concluir seus prazos usando /meus ou clicando no botão do lembrete._`;
+
+  await ctx.reply(text, { parse_mode: 'Markdown' });
+});
+
+/**
+ * /hoje: Lista os prazos que vencem hoje, amanhã ou estão atrasados
+ */
+bot.command('hoje', async (ctx) => {
+  const allProcesses = await getAllPendingProcesses();
+  const urgent = allProcesses.filter((p) => calculateDaysRemaining(p.due_date) <= 1);
+
+  if (urgent.length === 0) {
+    return ctx.reply('✅ *Nenhum prazo urgente!*\nNão há prazos atrasados, vencendo hoje ou amanhã no escritório.', {
+      parse_mode: 'Markdown',
+    });
+  }
+
+  let text = `⚡ *PRAZOS URGENTES DO ESCRITÓRIO (${urgent.length})*\n\n`;
+
+  for (const p of urgent) {
+    const daysRemaining = calculateDaysRemaining(p.due_date);
+    const badge = getUrgencyBadge(daysRemaining);
+
+    text +=
+      `${badge.emoji} *[${badge.tag}]* Responsável: *${p.owner_name}*\n` +
+      `📂 Proc: \`${p.process_number}\` | Cliente: *${p.client_name}*\n` +
+      `⏳ Prazo: _${p.deadline_info}_\n` +
+      `📅 Vencimento: *${formatDateBR(p.due_date)}*\n\n`;
+  }
+
+  await ctx.reply(text, { parse_mode: 'Markdown' });
+});
+
+/**
+ * /teste_alerta: Dispara manualmente a rotina de notificações
+ */
+bot.command('teste_alerta', async (ctx) => {
+  await ctx.reply('⏳ *Iniciando disparo de teste dos alertas...*', { parse_mode: 'Markdown' });
+
+  try {
+    const result = await executeDeadlineCheck(bot, { isUrgentOnly: false, manualTrigger: true });
+    const replyText =
+      `🚀 *Teste de Alerta Concluído!*\n\n` +
+      `• *Total de processos pendentes checados:* ${result.totalProcessesChecked}\n` +
+      `• *Prazos em período de alerta:* ${result.alertedCount}\n` +
+      `• *Notificações enviadas no privado:* ${result.privateMessagesSent}\n` +
+      `• *Painel enviado no Grupo Geral:* ${result.groupNotified ? '✅ Sim' : '❌ Não (verifique /definir_grupo)'}`;
+
+    await ctx.reply(replyText, { parse_mode: 'Markdown' });
+  } catch (err: any) {
+    await ctx.reply(`❌ Falha ao executar teste de alerta: ${err.message}`);
+  }
+});
+
+/**
+ * /ajuda: Manual completo de ajuda
+ */
+bot.command('ajuda', async (ctx) => {
+  const helpText =
+    `📖 *MANUAL DO BOT DE PRAZOS DO ESCRITÓRIO*\n\n` +
+    `🤖 *1. Como Cadastrar Prazos:*\n` +
+    `• *Por Áudio:* Basta mandar uma mensagem de voz no privado ou grupo dizendo: _"Processo 12345 do cliente João da Silva, recurso de apelação que vence na próxima terça-feira"_. A Inteligência Artificial (Gemini) entenderá automaticamente!\n` +
+    `• *Por Texto Livre:* Envie: _"Processo 99999 cliente Petrobras prazo contestação vence dia 20/11"_\n` +
+    `• *Por Comando Estrito:* \`/novo Nº | Cliente | Prazo | DD/MM/AAAA\`\n\n` +
+    `📊 *2. Comandos de Consulta:*\n` +
+    `• \`/meus\` - Mostra os seus prazos com botões rápidos de baixa.\n` +
+    `• \`/geral\` - Painel de todos os prazos dos 3 membros separados por pessoa.\n` +
+    `• \`/hoje\` - Mostra os prazos urgentes (hoje, amanhã e atrasados).\n\n` +
+    `⏰ *3. Horários das Notificações Automáticas:*\n` +
+    `• *08:30:* Notificação individual no privado de cada responsável + Painel Geral no grupo do escritório.\n` +
+    `• *14:00 e 17:00:* Cobrança urgente apenas para o que vence hoje, amanhã ou está atrasado.\n\n` +
+    `⚙️ *4. Configuração:*\n` +
+    `• \`/definir_grupo\` - Digite este comando dentro do grupo do Telegram do escritório para vinculá-lo.\n` +
+    `• \`/nome [Apelido]\` - Altera seu nome de exibição no painel da equipe.\n` +
+    `• \`/teste_alerta\` - Dispara o teste dos alertas na hora.`;
+
+  await ctx.reply(helpText, { parse_mode: 'Markdown' });
+});
+
+// ==========================================
+// CALLBACKS DOS BOTÕES INLINE (CONCLUIR / EXCLUIR)
+// ==========================================
+
+bot.callbackQuery(/^done:(\d+)$/, async (ctx) => {
+  const processId = parseInt(ctx.match[1], 10);
+  const user = await ensureUserRegistered(ctx);
+
+  try {
+    const existing = await getProcessById(processId);
+    if (!existing) {
+      return ctx.answerCallbackQuery({ text: '⚠️ Prazo não encontrado.', show_alert: true });
+    }
+
+    if (existing.status === 'CONCLUIDO') {
+      return ctx.answerCallbackQuery({
+        text: `Este prazo já foi concluído por ${existing.completed_by || 'outro membro'}!`,
+        show_alert: true,
+      });
+    }
+
+    const updated = await completeProcess(processId, user.name);
+    await ctx.answerCallbackQuery({ text: '✅ Prazo concluído com sucesso!' });
+
+    // Edita a mensagem original do chat atual
+    const nowBR = new Date().toLocaleString('pt-BR', { timeZone: config.timezone });
+    try {
+      await ctx.editMessageText(
+        `✅ *PRAZO CONCLUÍDO!*\n\n` +
+        `📂 *Processo:* \`${existing.process_number}\`\n` +
+        `👤 *Cliente:* ${existing.client_name}\n` +
+        `⏳ *Prazo:* ${existing.deadline_info}\n` +
+        `📅 *Vencimento:* ${formatDateBR(existing.due_date)}\n\n` +
+        `🎉 Concluído por *${user.name}* em ${nowBR}.\n` +
+        `_Lembretes automáticos encerrados._`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (editErr) {
+      // Se não der para editar mensagem antiga, ignora
+    }
+
+    // Avisa no Grupo Geral do Escritório
+    if (updated) {
+      await notifyOfficeGroupCompleted(updated, user.name);
+    }
+  } catch (err: any) {
+    await ctx.answerCallbackQuery({ text: `Erro: ${err.message}`, show_alert: true });
+  }
+});
+
+bot.callbackQuery(/^delete:(\d+)$/, async (ctx) => {
+  const processId = parseInt(ctx.match[1], 10);
+  const user = await ensureUserRegistered(ctx);
+
+  try {
+    const existing = await getProcessById(processId);
+    if (!existing) {
+      return ctx.answerCallbackQuery({ text: '⚠️ Prazo não encontrado.', show_alert: true });
+    }
+
+    await cancelProcess(processId);
+    await ctx.answerCallbackQuery({ text: '🗑️ Prazo excluído/cancelado.' });
+
+    try {
+      await ctx.editMessageText(
+        `🗑️ *Prazo Cancelado/Excluído*\n` +
+        `Processo \`${existing.process_number}\` (${existing.client_name}) cancelado por *${user.name}*.`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (editErr) {
+      // Ignora erro de edição
+    }
+  } catch (err: any) {
+    await ctx.answerCallbackQuery({ text: `Erro: ${err.message}`, show_alert: true });
+  }
+});
+
+// ==========================================
+// CAPTURA DE ÁUDIO / MENSAGENS DE VOZ
+// ==========================================
+
+bot.on(['message:voice', 'message:audio'], async (ctx) => {
+  const user = await ensureUserRegistered(ctx);
+
+  if (!config.geminiApiKey) {
+    return ctx.reply(
+      '⚠️ O processamento de áudio requer a chave `GEMINI_API_KEY` configurada no arquivo `.env`.\n' +
+      'Por enquanto, utilize o comando `/novo [Nº] | [Cliente] | [Prazo] | [DD/MM/AAAA]`.',
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  const statusMsg = await ctx.reply('🎙️ *Ouvindo e analisando o áudio com IA...*', {
+    parse_mode: 'Markdown',
+  });
+
+  try {
+    const voiceOrAudio = ctx.message?.voice || ctx.message?.audio;
+    if (!voiceOrAudio) throw new Error('Arquivo de áudio não detectado.');
+
+    const file = await ctx.getFile();
+    if (!file.file_path) throw new Error('Não foi possível obter o caminho do arquivo de áudio.');
+
+    const fileUrl = `https://api.telegram.org/file/bot${config.telegramBotToken}/${file.file_path}`;
+    const response = await fetch(fileUrl);
+    if (!response.ok) throw new Error(`Falha ao baixar áudio: HTTP ${response.status}`);
+
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    const mimeType = voiceOrAudio.mime_type || 'audio/ogg';
+
+    const parsed = await parseDeadlineFromAudio(buffer, mimeType);
+
+    if (!parsed) {
+      await ctx.api.editMessageText(
+        ctx.chat.id,
+        statusMsg.message_id,
+        '❌ Não consegui identificar os dados do processo no áudio.\n' +
+        'Por favor, tente falar mais pausadamente citando: *Número do processo*, *Nome do cliente*, *Qual o prazo* e *Data de vencimento*.'
+      );
+      return;
+    }
+
+    // Salva o processo extraído do áudio
+    const process = await createProcess({
+      process_number: parsed.process_number,
+      client_name: parsed.client_name,
+      deadline_info: parsed.deadline_info,
+      owner_telegram_id: user.id,
+      owner_name: user.name,
+      due_date: parsed.due_date,
+      remind_days_before: parsed.remind_days_before,
+    });
+
+    const keyboard = new InlineKeyboard()
+      .text('✅ Concluir Prazo', `done:${process.id}`)
+      .text('🗑️ Excluir', `delete:${process.id}`);
+
+    await ctx.api.editMessageText(
+      ctx.chat.id,
+      statusMsg.message_id,
+      `🎙️ *Prazo Extraído do Áudio com Sucesso!*\n\n` +
+      `📂 *Processo:* \`${process.process_number}\`\n` +
+      `👤 *Cliente:* ${process.client_name}\n` +
+      `⏳ *Prazo:* ${process.deadline_info}\n` +
+      `📅 *Vencimento:* ${formatDateBR(process.due_date)}\n` +
+      `🔔 *Avisar:* ${process.remind_days_before} dias antes\n` +
+      `📌 *Responsável:* ${process.owner_name}`,
+      { parse_mode: 'Markdown', reply_markup: keyboard }
+    );
+
+    // Notifica o grupo geral
+    await notifyOfficeGroupNewProcess(process, user.name);
+  } catch (err: any) {
+    console.error('[AUDIO] Erro no processamento de áudio:', err);
+    await ctx.api.editMessageText(
+      ctx.chat.id,
+      statusMsg.message_id,
+      `❌ Erro ao processar áudio: ${err.message}`
+    );
+  }
+});
+
+// ==========================================
+// CAPTURA DE TEXTO LIVRE / LINGUAGEM NATURAL
+// ==========================================
+
+bot.on('message:text', async (ctx) => {
+  const text = ctx.message.text.trim();
+
+  // Ignora mensagens que comecem com barra (comandos)
+  if (text.startsWith('/')) return;
+
+  const isPrivate = ctx.chat.type === 'private';
+  const startsWithPrazo = text.toLowerCase().startsWith('prazo:') || text.toLowerCase().startsWith('prazo');
+
+  // Só processa se for no privado ou se no grupo começar com "prazo"
+  if (!isPrivate && !startsWithPrazo) {
+    return;
+  }
+
+  const user = await ensureUserRegistered(ctx);
+
+  // Tenta interpretar com IA / regex
+  const parsed = await parseDeadlineFromText(text);
+
+  if (parsed) {
+    try {
+      const process = await createProcess({
+        process_number: parsed.process_number,
+        client_name: parsed.client_name,
+        deadline_info: parsed.deadline_info,
+        owner_telegram_id: user.id,
+        owner_name: user.name,
+        due_date: parsed.due_date,
+        remind_days_before: parsed.remind_days_before,
+      });
+
+      const keyboard = new InlineKeyboard()
+        .text('✅ Concluir Prazo', `done:${process.id}`)
+        .text('🗑️ Excluir', `delete:${process.id}`);
+
+      await ctx.reply(
+        `✅ *Prazo Identificado e Cadastrado!*\n\n` +
+        `📂 *Processo:* \`${process.process_number}\`\n` +
+        `👤 *Cliente:* ${process.client_name}\n` +
+        `⏳ *Prazo:* ${process.deadline_info}\n` +
+        `📅 *Vencimento:* ${formatDateBR(process.due_date)}\n` +
+        `🔔 *Avisar:* ${process.remind_days_before} dias antes\n` +
+        `📌 *Responsável:* ${process.owner_name}`,
+        { parse_mode: 'Markdown', reply_markup: keyboard }
+      );
+
+      // Notifica o grupo geral
+      await notifyOfficeGroupNewProcess(process, user.name);
+      return;
+    } catch (err: any) {
+      return ctx.reply(`❌ Erro ao salvar prazo: ${err.message}`);
+    }
+  }
+
+  // Se o usuário digitou no privado algo que não foi identificado
+  if (isPrivate) {
+    await ctx.reply(
+      `🤔 Não identifiquei todos os dados do prazo na sua mensagem.\n\n` +
+      `Para cadastrar, você pode:\n` +
+      `1. Falar por *áudio* 🎙️\n` +
+      `2. Escrever em linguagem natural citando número, cliente e data: _"Processo 12345 do cliente Silva vence dia 15/11"_\n` +
+      `3. Usar o comando: \`/novo [Nº] | [Cliente] | [Prazo] | [DD/MM/AAAA]\`\n\n` +
+      `Digite \`/ajuda\` para mais detalhes.`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+});
+
+// Tratamento de erros do bot para que o processo nunca caia
+bot.catch((err) => {
+  console.error('[BOT ERROR] Erro capturado no ciclo de eventos do bot:', err);
+});
