@@ -19,6 +19,14 @@ export interface AlertExecutionResult {
 }
 
 /**
+ * Escapa caracteres reservados do Markdown do Telegram
+ */
+function escapeMarkdown(text: string): string {
+  if (!text) return '';
+  return text.replace(/([_*`\[\]()])/g, '\\$1');
+}
+
+/**
  * Retorna o cabeçalho/status visual de urgência
  */
 export function getUrgencyBadge(daysRemaining: number): { label: string; tag: string; emoji: string } {
@@ -96,9 +104,9 @@ export async function executeDeadlineCheck(
     const messageText =
       `${badge.emoji} *LEMBRETE DE PRAZO PROCESSUAL*\n\n` +
       `*Status:* ${badge.label}\n` +
-      `📂 *Processo:* \`${proc.process_number}\`\n` +
-      `👤 *Cliente:* ${proc.client_name}\n` +
-      `⏳ *Prazo:* ${proc.deadline_info}\n` +
+      `📂 *Processo:* \`${escapeMarkdown(proc.process_number)}\`\n` +
+      `👤 *Cliente:* ${escapeMarkdown(proc.client_name)}\n` +
+      `⏳ *Prazo:* ${escapeMarkdown(proc.deadline_info)}\n` +
       `📅 *Vencimento:* ${formatDateBR(proc.due_date)}\n\n` +
       `_Clique abaixo quando concluir a peça/ato para parar as notificações e avisar a equipe:_`;
 
@@ -141,12 +149,12 @@ export async function executeDeadlineCheck(
       let groupMessage = `${titlePrefix}\n📅 Data: ${todayStrBR} | Horário de Brasília\n\n`;
 
       for (const [ownerName, items] of groupedByOwner.entries()) {
-        groupMessage += `👤 *${ownerName}* (${items.length} prazo${items.length > 1 ? 's' : ''}):\n`;
+        groupMessage += `👤 *${escapeMarkdown(ownerName)}* (${items.length} prazo${items.length > 1 ? 's' : ''}):\n`;
         for (const { process: p, daysRemaining } of items) {
           const badge = getUrgencyBadge(daysRemaining);
           groupMessage +=
-            `  • [${badge.tag}] Proc: \`${p.process_number}\` | Cli: *${p.client_name}*\n` +
-            `    Tarefa: _${p.deadline_info}_ (Vence: ${formatDateBR(p.due_date)})\n`;
+            `  • [${badge.tag}] Proc: \`${escapeMarkdown(p.process_number)}\` | Cli: *${escapeMarkdown(p.client_name)}*\n` +
+            `    Tarefa: _${escapeMarkdown(p.deadline_info)}_ (Vence: ${formatDateBR(p.due_date)})\n`;
         }
         groupMessage += '\n';
       }

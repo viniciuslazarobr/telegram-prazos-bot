@@ -24,6 +24,14 @@ import { executeDeadlineCheck, getUrgencyBadge } from './cron';
 export const bot = new Bot(config.telegramBotToken);
 
 /**
+ * Escapa caracteres reservados do Markdown do Telegram para evitar erros de parsing (400 Bad Request)
+ */
+export function escapeMarkdown(text: string): string {
+  if (!text) return '';
+  return text.replace(/([_*`\[\]()])/g, '\\$1');
+}
+
+/**
  * Garante que o usuário que enviou a mensagem está registrado no Supabase
  */
 async function ensureUserRegistered(ctx: any): Promise<{ id: string; name: string }> {
@@ -35,15 +43,21 @@ async function ensureUserRegistered(ctx: any): Promise<{ id: string; name: strin
   const userId = String(from.id);
   const fullName = [from.first_name, from.last_name].filter(Boolean).join(' ') || from.username || `Usuário ${userId}`;
 
-  // Busca se já existe cadastro com nome customizado
-  const existing = await getTeamMember(userId);
-  if (existing) {
-    return { id: userId, name: existing.name };
-  }
+  try {
+    // Busca se já existe cadastro com nome customizado
+    const existing = await getTeamMember(userId);
+    if (existing) {
+      return { id: userId, name: existing.name };
+    }
 
-  // Se não existir, cadastra automaticamente
-  const saved = await upsertTeamMember(userId, fullName, from.username || null);
-  return { id: userId, name: saved.name };
+    // Se não existir, cadastra automaticamente
+    const saved = await upsertTeamMember(userId, fullName, from.username || null);
+    return { id: userId, name: saved.name };
+  } catch (err: any) {
+    console.warn(`[ensureUserRegistered] Aviso: Banco de dados inacessível ou tabelas não criadas (${err.message})`);
+    // Retorna identificação básica sem travar o bot
+    return { id: userId, name: fullName };
+  }
 }
 
 /**
@@ -54,13 +68,13 @@ async function notifyOfficeGroupNewProcess(proc: Process, creatorName: string): 
   if (!officeGroupChatId) return;
 
   const msg =
-    `📢 *${creatorName} cadastrou um novo prazo:*\n\n` +
-    `📂 *Processo:* \`${proc.process_number}\`\n` +
-    `👤 *Cliente:* *${proc.client_name}*\n` +
-    `⏳ *Prazo:* _${proc.deadline_info}_\n` +
+    `📢 *${escapeMarkdown(creatorName)} cadastrou um novo prazo:*\n\n` +
+    `📂 *Processo:* \`${escapeMarkdown(proc.process_number)}\`\n` +
+    `👤 *Cliente:* *${escapeMarkdown(proc.client_name)}*\n` +
+    `⏳ *Prazo:* _${escapeMarkdown(proc.deadline_info)}_\n` +
     `📅 *Vencimento:* *${formatDateBR(proc.due_date)}*\n` +
     `🔔 *Avisos:* ${proc.remind_days_before} dias antes\n` +
-    `📌 *Responsável:* ${proc.owner_name}`;
+    `📌 *Responsável:* ${escapeMarkdown(proc.owner_name)}`;
 
   try {
     await bot.api.sendMessage(officeGroupChatId, msg, { parse_mode: 'Markdown' });
@@ -77,9 +91,9 @@ async function notifyOfficeGroupCompleted(proc: Process, completedByName: string
   if (!officeGroupChatId) return;
 
   const msg =
-    `✅ *${completedByName}* concluiu o prazo do Processo \`${proc.process_number}\`!\n\n` +
-    `👤 *Cliente:* ${proc.client_name}\n` +
-    `⏳ *Prazo:* ${proc.deadline_info}\n` +
+    `✅ *${escapeMarkdown(completedByName)}* concluiu o prazo do Processo \`${escapeMarkdown(proc.process_number)}\`!\n\n` +
+    `👤 *Cliente:* ${escapeMarkdown(proc.client_name)}\n` +
+    `⏳ *Prazo:* ${escapeMarkdown(proc.deadline_info)}\n` +
     `📅 *Vencimento original:* ${formatDateBR(proc.due_date)}\n` +
     `🎉 _Lembretes automáticos deste prazo foram encerrados._`;
 
@@ -98,27 +112,35 @@ async function notifyOfficeGroupCompleted(proc: Process, completedByName: string
  * /start: Registro e apresentação do Bot
  */
 bot.command('start', async (ctx) => {
-  const user = await ensureUserRegistered(ctx);
+  try {
+    const user = await ensureUserRegistered(ctx);
 
-  const welcome =
-    `⚖️ *Bem-vindo(a) ao Bot de Prazos do Escritório!*\n\n` +
-    `Olá, *${user.name}*! Seu usuário já está vinculado ao sistema.\n\n` +
-    `📌 *Como funciona:*\n` +
-    `1. Cada membro da equipe cadastra seus prazos por *áudio*, *texto livre* ou comando.\n` +
-    `2. Nos horários de cobrança (08:30, 14:00 e 17:00), o Bot manda uma notificação privada para você com botão de dar baixa.\n` +
-    `3. O *Grupo Geral do Escritório* recebe o resumo diário da equipe e avisos sempre que alguém cadastrar ou concluir um prazo.\n\n` +
-    `🛠️ *Comandos Principais:*\n` +
-    `• \`/meus\` - Ver seus prazos pendentes\n` +
-    `• \`/geral\` - Ver os prazos de todos os 3 membros da equipe\n` +
-    `• \`/hoje\` - Ver prazos de hoje, amanhã ou atrasados\n` +
-    `• \`/novo [Nº] | [Cliente] | [Prazo] | [DD/MM/AAAA]\` - Cadastrar prazo\n` +
-    `• \`/nome [Seu Apelido]\` - Mudar seu nome de exibição\n` +
-    `• \`/definir_grupo\` - Definir o grupo atual como Painel do Escritório\n` +
-    `• \`/teste_alerta\` - Disparar teste imediato dos lembretes\n` +
-    `• \`/ajuda\` - Manual completo de uso\n\n` +
-    `💡 *Dica:* Você pode simplesmente enviar um *áudio de voz* ou escrever: _"Processo 12345 do cliente Silva, contestação vence 15/11"_ que eu cadastro automaticamente!`;
+    const welcome =
+      `⚖️ *Bem-vindo(a) ao Bot de Prazos do Escritório!*\n\n` +
+      `Olá, *${escapeMarkdown(user.name)}*! Seu usuário já está vinculado ao sistema.\n\n` +
+      `📌 *Como funciona:*\n` +
+      `1. Cada membro da equipe cadastra seus prazos por *áudio*, *texto livre* ou comando.\n` +
+      `2. Nos horários de cobrança (08:30, 14:00 e 17:00), o Bot manda uma notificação privada para você com botão de dar baixa.\n` +
+      `3. O *Grupo Geral do Escritório* recebe o resumo diário da equipe e avisos sempre que alguém cadastrar ou concluir um prazo.\n\n` +
+      `🛠️ *Comandos Principais:*\n` +
+      `• \`/meus\` - Ver seus prazos pendentes\n` +
+      `• \`/geral\` - Ver os prazos de todos os 3 membros da equipe\n` +
+      `• \`/hoje\` - Ver prazos de hoje, amanhã ou atrasados\n` +
+      `• \`/novo [Nº] | [Cliente] | [Prazo] | [DD/MM/AAAA]\` - Cadastrar prazo\n` +
+      `• \`/nome [Seu Apelido]\` - Mudar seu nome de exibição\n` +
+      `• \`/definir_grupo\` - Definir o grupo atual como Painel do Escritório\n` +
+      `• \`/teste_alerta\` - Disparar teste imediato dos lembretes\n` +
+      `• \`/ajuda\` - Manual completo de uso\n\n` +
+      `💡 *Dica:* Você pode simplesmente enviar um *áudio de voz* ou escrever: _"Processo 12345 do cliente Silva, contestação vence 15/11"_ que eu cadastro automaticamente!`;
 
-  await ctx.reply(welcome, { parse_mode: 'Markdown' });
+    await ctx.reply(welcome, { parse_mode: 'Markdown' });
+  } catch (err: any) {
+    console.error('[START ERROR]', err);
+    await ctx.reply(
+      `⚠️ Erro ao iniciar: ${err.message}\n` +
+      `Dica: Verifique se o script SQL (schema.sql) foi executado no painel do Supabase.`
+    );
+  }
 });
 
 /**
@@ -137,11 +159,15 @@ bot.command('nome', async (ctx) => {
   try {
     const updated = await updateTeamMemberName(userId, args);
     await ctx.reply(
-      `✅ Seu nome de exibição foi atualizado para: *${updated.name}*!\nEle será usado nas listagens e notificações da equipe.`,
+      `✅ Seu nome de exibição foi atualizado para: *${escapeMarkdown(updated.name)}*!\n` +
+      `Ele será usado nas listagens e notificações da equipe.`,
       { parse_mode: 'Markdown' }
     );
   } catch (err: any) {
-    await ctx.reply(`❌ Erro ao atualizar nome: ${err.message}`);
+    await ctx.reply(
+      `❌ Erro ao atualizar nome: ${err.message}\n` +
+      `Verifique se as tabelas do Supabase foram criadas via schema.sql.`
+    );
   }
 });
 
@@ -212,7 +238,7 @@ bot.command('novo', async (ctx) => {
   const isoDate = parseDateBRToISO(dateRaw);
   if (!isoDate) {
     return ctx.reply(
-      `⚠️ Data inválida: *${dateRaw}*.\nPor favor, utilize o formato *DD/MM/AAAA* (ex: 25/11/2026).`,
+      `⚠️ Data inválida: *${escapeMarkdown(dateRaw)}*.\nPor favor, utilize o formato *DD/MM/AAAA* (ex: 25/11/2026).`,
       { parse_mode: 'Markdown' }
     );
   }
@@ -237,12 +263,12 @@ bot.command('novo', async (ctx) => {
 
     await ctx.reply(
       `✅ *Prazo Cadastrado com Sucesso!*\n\n` +
-      `📂 *Processo:* \`${process.process_number}\`\n` +
-      `👤 *Cliente:* ${process.client_name}\n` +
-      `⏳ *Prazo:* ${process.deadline_info}\n` +
+      `📂 *Processo:* \`${escapeMarkdown(process.process_number)}\`\n` +
+      `👤 *Cliente:* ${escapeMarkdown(process.client_name)}\n` +
+      `⏳ *Prazo:* ${escapeMarkdown(process.deadline_info)}\n` +
       `📅 *Vencimento:* ${formatDateBR(process.due_date)}\n` +
       `🔔 *Avisar com:* ${process.remind_days_before} dias de antecedência\n` +
-      `📌 *Responsável:* ${process.owner_name}`,
+      `📌 *Responsável:* ${escapeMarkdown(process.owner_name)}`,
       { parse_mode: 'Markdown', reply_markup: keyboard }
     );
 
@@ -261,7 +287,7 @@ bot.command('meus', async (ctx) => {
   const myProcesses = await getMyPendingProcesses(user.id);
 
   if (myProcesses.length === 0) {
-    return ctx.reply(`🎉 *Parabéns, ${user.name}!*\nVocê não possui nenhum prazo pendente no momento.`, {
+    return ctx.reply(`🎉 *Parabéns, ${escapeMarkdown(user.name)}!*\nVocê não possui nenhum prazo pendente no momento.`, {
       parse_mode: 'Markdown',
     });
   }
@@ -273,9 +299,9 @@ bot.command('meus', async (ctx) => {
     const badge = getUrgencyBadge(daysRemaining);
 
     text +=
-      `${badge.emoji} *[${badge.tag}]* Proc: \`${proc.process_number}\`\n` +
-      `👤 Cliente: *${proc.client_name}*\n` +
-      `⏳ Prazo: _${proc.deadline_info}_\n` +
+      `${badge.emoji} *[${badge.tag}]* Proc: \`${escapeMarkdown(proc.process_number)}\`\n` +
+      `👤 Cliente: *${escapeMarkdown(proc.client_name)}*\n` +
+      `⏳ Prazo: _${escapeMarkdown(proc.deadline_info)}_\n` +
       `📅 Vencimento: *${formatDateBR(proc.due_date)}* (${badge.label})\n\n`;
   }
 
@@ -314,13 +340,13 @@ bot.command('geral', async (ctx) => {
   let text = `📊 *PAINEL GERAL DO ESCRITÓRIO - PRAZOS PENDENTES (${allProcesses.length})*\n\n`;
 
   for (const [ownerName, procs] of grouped.entries()) {
-    text += `👤 *${ownerName}* (${procs.length} prazo${procs.length > 1 ? 's' : ''}):\n`;
+    text += `👤 *${escapeMarkdown(ownerName)}* (${procs.length} prazo${procs.length > 1 ? 's' : ''}):\n`;
     for (const p of procs) {
       const daysRemaining = calculateDaysRemaining(p.due_date);
       const badge = getUrgencyBadge(daysRemaining);
       text +=
-        `  ${badge.emoji} \`${p.process_number}\` | *${p.client_name}*\n` +
-        `     ↳ _${p.deadline_info}_ (Vence: *${formatDateBR(p.due_date)}* [${badge.tag}])\n`;
+        `  ${badge.emoji} \`${escapeMarkdown(p.process_number)}\` | *${escapeMarkdown(p.client_name)}*\n` +
+        `     ↳ _${escapeMarkdown(p.deadline_info)}_ (Vence: *${formatDateBR(p.due_date)}* [${badge.tag}])\n`;
     }
     text += '\n';
   }
@@ -350,9 +376,9 @@ bot.command('hoje', async (ctx) => {
     const badge = getUrgencyBadge(daysRemaining);
 
     text +=
-      `${badge.emoji} *[${badge.tag}]* Responsável: *${p.owner_name}*\n` +
-      `📂 Proc: \`${p.process_number}\` | Cliente: *${p.client_name}*\n` +
-      `⏳ Prazo: _${p.deadline_info}_\n` +
+      `${badge.emoji} *[${badge.tag}]* Responsável: *${escapeMarkdown(p.owner_name)}*\n` +
+      `📂 Proc: \`${escapeMarkdown(p.process_number)}\` | Cliente: *${escapeMarkdown(p.client_name)}*\n` +
+      `⏳ Prazo: _${escapeMarkdown(p.deadline_info)}_\n` +
       `📅 Vencimento: *${formatDateBR(p.due_date)}*\n\n`;
   }
 
@@ -372,7 +398,7 @@ bot.command('teste_alerta', async (ctx) => {
       `• *Total de processos pendentes checados:* ${result.totalProcessesChecked}\n` +
       `• *Prazos em período de alerta:* ${result.alertedCount}\n` +
       `• *Notificações enviadas no privado:* ${result.privateMessagesSent}\n` +
-      `• *Painel enviado no Grupo Geral:* ${result.groupNotified ? '✅ Sim' : '❌ Não (verifique /definir_grupo)'}`;
+      `• *Painel enviado no Grupo Geral:* ${result.groupNotified ? '✅ Sim' : '❌ Não (verifique `/definir_grupo`)'}`;
 
     await ctx.reply(replyText, { parse_mode: 'Markdown' });
   } catch (err: any) {
@@ -434,11 +460,11 @@ bot.callbackQuery(/^done:(\d+)$/, async (ctx) => {
     try {
       await ctx.editMessageText(
         `✅ *PRAZO CONCLUÍDO!*\n\n` +
-        `📂 *Processo:* \`${existing.process_number}\`\n` +
-        `👤 *Cliente:* ${existing.client_name}\n` +
-        `⏳ *Prazo:* ${existing.deadline_info}\n` +
+        `📂 *Processo:* \`${escapeMarkdown(existing.process_number)}\`\n` +
+        `👤 *Cliente:* ${escapeMarkdown(existing.client_name)}\n` +
+        `⏳ *Prazo:* ${escapeMarkdown(existing.deadline_info)}\n` +
         `📅 *Vencimento:* ${formatDateBR(existing.due_date)}\n\n` +
-        `🎉 Concluído por *${user.name}* em ${nowBR}.\n` +
+        `🎉 Concluído por *${escapeMarkdown(user.name)}* em ${nowBR}.\n` +
         `_Lembretes automáticos encerrados._`,
         { parse_mode: 'Markdown' }
       );
@@ -471,7 +497,7 @@ bot.callbackQuery(/^delete:(\d+)$/, async (ctx) => {
     try {
       await ctx.editMessageText(
         `🗑️ *Prazo Cancelado/Excluído*\n` +
-        `Processo \`${existing.process_number}\` (${existing.client_name}) cancelado por *${user.name}*.`,
+        `Processo \`${escapeMarkdown(existing.process_number)}\` (${escapeMarkdown(existing.client_name)}) cancelado por *${escapeMarkdown(user.name)}*.`,
         { parse_mode: 'Markdown' }
       );
     } catch (editErr) {
@@ -491,7 +517,7 @@ bot.on(['message:voice', 'message:audio'], async (ctx) => {
 
   if (!config.geminiApiKey) {
     return ctx.reply(
-      '⚠️ O processamento de áudio requer a chave `GEMINI_API_KEY` configurada no arquivo `.env`.\n' +
+      '⚠️ O processamento de áudio requer a chave `GEMINI_API_KEY` configurada no Render.\n' +
       'Por enquanto, utilize o comando `/novo [Nº] | [Cliente] | [Prazo] | [DD/MM/AAAA]`.',
       { parse_mode: 'Markdown' }
     );
@@ -547,12 +573,12 @@ bot.on(['message:voice', 'message:audio'], async (ctx) => {
       ctx.chat.id,
       statusMsg.message_id,
       `🎙️ *Prazo Extraído do Áudio com Sucesso!*\n\n` +
-      `📂 *Processo:* \`${process.process_number}\`\n` +
-      `👤 *Cliente:* ${process.client_name}\n` +
-      `⏳ *Prazo:* ${process.deadline_info}\n` +
+      `📂 *Processo:* \`${escapeMarkdown(process.process_number)}\`\n` +
+      `👤 *Cliente:* ${escapeMarkdown(process.client_name)}\n` +
+      `⏳ *Prazo:* ${escapeMarkdown(process.deadline_info)}\n` +
       `📅 *Vencimento:* ${formatDateBR(process.due_date)}\n` +
       `🔔 *Avisar:* ${process.remind_days_before} dias antes\n` +
-      `📌 *Responsável:* ${process.owner_name}`,
+      `📌 *Responsável:* ${escapeMarkdown(process.owner_name)}`,
       { parse_mode: 'Markdown', reply_markup: keyboard }
     );
 
@@ -609,12 +635,12 @@ bot.on('message:text', async (ctx) => {
 
       await ctx.reply(
         `✅ *Prazo Identificado e Cadastrado!*\n\n` +
-        `📂 *Processo:* \`${process.process_number}\`\n` +
-        `👤 *Cliente:* ${process.client_name}\n` +
-        `⏳ *Prazo:* ${process.deadline_info}\n` +
+        `📂 *Processo:* \`${escapeMarkdown(process.process_number)}\`\n` +
+        `👤 *Cliente:* ${escapeMarkdown(process.client_name)}\n` +
+        `⏳ *Prazo:* ${escapeMarkdown(process.deadline_info)}\n` +
         `📅 *Vencimento:* ${formatDateBR(process.due_date)}\n` +
         `🔔 *Avisar:* ${process.remind_days_before} dias antes\n` +
-        `📌 *Responsável:* ${process.owner_name}`,
+        `📌 *Responsável:* ${escapeMarkdown(process.owner_name)}`,
         { parse_mode: 'Markdown', reply_markup: keyboard }
       );
 
