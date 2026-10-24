@@ -7,8 +7,10 @@ import {
   formatDateBR,
   getTodayDateString,
   Process,
+  DEFAULT_OFFICE_GROUP_ID,
 } from './supabase';
 import { config } from './config';
+import { logEvent } from './server';
 
 export interface AlertExecutionResult {
   totalProcessesChecked: number;
@@ -80,12 +82,10 @@ export async function executeDeadlineCheck(
     const daysRemaining = calculateDaysRemaining(proc.due_date);
 
     if (isUrgentOnly) {
-      // 14h / 17h: apenas atrasados, vence hoje ou amanhã
       if (daysRemaining <= 1) {
         alertableProcesses.push({ process: proc, daysRemaining });
       }
     } else {
-      // 08:30 / Teste geral: dentro da janela configurada de antecedência
       if (daysRemaining <= proc.remind_days_before) {
         alertableProcesses.push({ process: proc, daysRemaining });
       }
@@ -126,11 +126,10 @@ export async function executeDeadlineCheck(
 
   // 2. DISPARO NO GRUPO GERAL DO ESCRITÓRIO
   let groupNotified = false;
-  const officeGroupChatId = await getOfficeGroupChatId();
+  const officeGroupChatId = (await getOfficeGroupChatId()) || DEFAULT_OFFICE_GROUP_ID;
 
   if (officeGroupChatId) {
     if (alertableProcesses.length > 0) {
-      // Agrupa os processos por responsável
       const groupedByOwner = new Map<string, Array<{ process: Process; daysRemaining: number }>>();
 
       for (const item of alertableProcesses) {
@@ -168,9 +167,9 @@ export async function executeDeadlineCheck(
         groupNotified = true;
       } catch (err: any) {
         console.error('[CRON] Falha ao enviar painel no Grupo Geral do Escritório:', err?.message || err);
+        logEvent('cron_group_send_error', { error: err.message, officeGroupChatId });
       }
     } else if (!isUrgentOnly || isManual) {
-      // Mensagem amigável de que está tudo em dia
       const todayStrBR = formatDateBR(getTodayDateString());
       const cleanMessage =
         `☀️ *PAINEL DO ESCRITÓRIO - TUDO EM DIA!*\n📅 ${todayStrBR}\n\n` +
@@ -183,10 +182,9 @@ export async function executeDeadlineCheck(
         groupNotified = true;
       } catch (err: any) {
         console.error('[CRON] Falha ao enviar mensagem de status no grupo:', err?.message || err);
+        logEvent('cron_group_send_error', { error: err.message, officeGroupChatId });
       }
     }
-  } else {
-    console.warn('[CRON] Grupo Geral do Escritório ainda não foi definido. Use /definir_grupo no grupo.');
   }
 
   console.log(

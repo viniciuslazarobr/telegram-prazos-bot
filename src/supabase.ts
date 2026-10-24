@@ -37,6 +37,11 @@ export const supabase = createClient(config.supabaseUrl, config.supabaseServiceR
 });
 
 /**
+ * ID padrão conhecido do grupo do escritório (extraído dos logs do Telegram)
+ */
+export const DEFAULT_OFFICE_GROUP_ID = '-1003976237316';
+
+/**
  * Obtém a data de hoje no fuso horário configurado no formato YYYY-MM-DD
  */
 export function getTodayDateString(timezone: string = config.timezone): string {
@@ -51,10 +56,6 @@ export function getTodayDateString(timezone: string = config.timezone): string {
 
 /**
  * Calcula a diferença em dias corridos entre a data atual de São Paulo e a data de vencimento.
- * < 0: Atrasado
- * = 0: Vence hoje
- * = 1: Vence amanhã
- * > 1: Dias restantes
  */
 export function calculateDaysRemaining(dueDateStr: string, timezone: string = config.timezone): number {
   const todayStr = getTodayDateString(timezone);
@@ -90,7 +91,6 @@ export function parseDateBRToISO(brDateStr: string): string | null {
   const month = match[2].padStart(2, '0');
   const year = match[3];
 
-  // Validação simples de dia e mês
   const dNum = parseInt(day, 10);
   const mNum = parseInt(month, 10);
   if (dNum < 1 || dNum > 31 || mNum < 1 || mNum > 12) return null;
@@ -188,32 +188,60 @@ export async function getAllTeamMembers(): Promise<TeamMember[]> {
 // ==========================================
 
 export async function getSetting(key: string): Promise<string | null> {
-  const { data, error } = await supabase
-    .from('app_settings')
-    .select('value')
-    .eq('key', key)
-    .maybeSingle();
+  try {
+    const { data, error } = await supabase
+      .from('app_settings')
+      .select('value')
+      .eq('key', key)
+      .maybeSingle();
 
-  if (error || !data) return null;
-  return data.value;
+    if (error || !data) return null;
+    const val = data.value?.trim();
+    return val && val.length > 0 ? val : null;
+  } catch (err) {
+    return null;
+  }
 }
 
 export async function setSetting(key: string, value: string): Promise<void> {
-  const { error } = await supabase
-    .from('app_settings')
-    .upsert({ key, value }, { onConflict: 'key' });
+  const cleanVal = String(value).trim();
 
-  if (error) {
-    throw new Error(`Falha ao salvar configuração [${key}]: ${error.message}`);
+  // 1. Tenta Upsert
+  const { error: upsertError } = await supabase
+    .from('app_settings')
+    .upsert({ key, value: cleanVal }, { onConflict: 'key' });
+
+  if (!upsertError) return;
+
+  // 2. Fallback: Update
+  const { data: updateData, error: updateError } = await supabase
+    .from('app_settings')
+    .update({ value: cleanVal })
+    .eq('key', key)
+    .select();
+
+  if (!updateError && updateData && updateData.length > 0) return;
+
+  // 3. Fallback: Insert
+  const { error: insertError } = await supabase
+    .from('app_settings')
+    .insert({ key, value: cleanVal });
+
+  if (insertError) {
+    throw new Error(`Falha ao salvar configuração [${key}]: ${insertError.message}`);
   }
 }
 
 export async function getOfficeGroupChatId(): Promise<string | null> {
-  return await getSetting('office_group_chat_id');
+  const saved = await getSetting('office_group_chat_id');
+  if (saved && saved.length > 0) return saved;
+
+  // Se ainda não salvo, retorna o ID detectado do grupo da equipe como padrão seguro
+  return DEFAULT_OFFICE_GROUP_ID;
 }
 
 export async function setOfficeGroupChatId(chatId: string | number): Promise<void> {
-  await setSetting('office_group_chat_id', String(chatId));
+  await setSetting('office_group_chat_id', String(chatId).trim());
 }
 
 // ==========================================
