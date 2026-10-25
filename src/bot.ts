@@ -360,32 +360,50 @@ bot.command(['limpar_banco', 'resetar_base'], async (ctx) => {
 });
 
 /**
- * /limpar_grupo: Apaga as últimas mensagens de teste do grupo
+ * /limpar_grupo: Apaga as últimas mensagens de teste do grupo (funciona no grupo ou no privado)
  */
 bot.command(['limpar_grupo', 'limpar_mensagens'], async (ctx) => {
   const chatType = ctx.chat?.type;
-  if (chatType !== 'group' && chatType !== 'supergroup') {
-    return ctx.reply('⚠️ Este comando deve ser executado **dentro do Grupo do Escritório**.');
+  let targetChatId: string | number = ctx.chat.id;
+  let startMsgId = ctx.message?.message_id;
+
+  if (chatType === 'private') {
+    const officeGroupId = (await getOfficeGroupChatId()) || DEFAULT_OFFICE_GROUP_ID;
+    if (!officeGroupId) {
+      return ctx.reply('⚠️ Grupo do escritório não configurado.');
+    }
+    targetChatId = officeGroupId;
+    try {
+      const ping = await ctx.api.sendMessage(targetChatId, '🧹 Limpando mensagens de teste...');
+      startMsgId = ping.message_id;
+    } catch (err: any) {
+      return ctx.reply(`❌ Não foi possível acessar o grupo para limpar: ${err.message}\nVerifique se o bot é administrador do grupo.`);
+    }
   }
 
-  const currentMsgId = ctx.message?.message_id;
-  if (!currentMsgId) return;
+  if (!startMsgId) return;
 
   const ids: number[] = [];
-  for (let id = currentMsgId; id >= Math.max(1, currentMsgId - 100); id--) {
+  for (let id = startMsgId; id >= Math.max(1, startMsgId - 100); id--) {
     ids.push(id);
   }
 
   try {
-    await ctx.api.deleteMessages(ctx.chat.id, ids);
+    await ctx.api.deleteMessages(targetChatId, ids);
   } catch (e) {
     for (const msgId of ids) {
       try {
-        await ctx.api.deleteMessage(ctx.chat.id, msgId);
+        await ctx.api.deleteMessage(targetChatId, msgId);
       } catch (err) {
-        // Ignora mensagens já deletadas
+        // Ignora
       }
     }
+  }
+
+  if (chatType === 'private') {
+    await ctx.reply('🧹 *Mensagens de teste do Grupo do Escritório apagadas com sucesso!*', {
+      parse_mode: 'Markdown',
+    });
   }
 });
 
