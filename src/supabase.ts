@@ -134,14 +134,44 @@ export async function upsertTeamMember(
 /**
  * Vincula retroativamente prazos que foram cadastrados previamente com o nome do membro
  */
+
+/**
+ * Normaliza um nome para comparação flexível (remove acentos, pontuação e títulos como Dr./Dra.)
+ */
+export function normalizePersonName(str: string): string {
+  if (!str) return '';
+  return str
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '') // remove acentos
+    .replace(/\b(dr|dra|doutor|doutora|adv|advogado|advogada|sr|sra)\b\.?/gi, '') // remove títulos
+    .replace(/[^a-z0-9\s]/g, '') // remove pontuação
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Compara se dois nomes se referem à mesma pessoa com inteligência jurídica e apelidos
+ */
+export function doPersonNamesMatch(name1: string, name2: string): boolean {
+  const n1 = normalizePersonName(name1);
+  const n2 = normalizePersonName(name2);
+  if (!n1 || !n2) return false;
+  if (n1 === n2 || n1.includes(n2) || n2.includes(n1)) return true;
+
+  // Compara tokens individuais (primeiro nome, sobrenome) com comprimento >= 3
+  const words1 = n1.split(' ').filter((w) => w.length >= 3);
+  const words2 = n2.split(' ').filter((w) => w.length >= 3);
+  return words1.some((w) => words2.includes(w));
+}
+
 export async function linkUnassignedProcessesToMember(
   telegramUserId: string | number,
   memberName: string
 ): Promise<number> {
   try {
     const idStr = String(telegramUserId);
-    const cleanName = memberName.trim().toLowerCase();
-    if (!cleanName) return 0;
+    if (!memberName || !memberName.trim()) return 0;
 
     const { data: unassigned, error: fetchErr } = await supabase
       .from('processes')
@@ -153,8 +183,7 @@ export async function linkUnassignedProcessesToMember(
 
     const toUpdateIds: number[] = [];
     for (const proc of unassigned) {
-      const oName = (proc.owner_name || '').trim().toLowerCase();
-      if (oName === cleanName || oName.includes(cleanName) || cleanName.includes(oName)) {
+      if (doPersonNamesMatch(proc.owner_name || '', memberName)) {
         toUpdateIds.push(proc.id);
       }
     }
@@ -176,7 +205,7 @@ export async function linkUnassignedProcessesToMember(
 export async function updateTeamMemberName(
   telegramUserId: string | number,
   newName: string
-): Promise<TeamMember> {
+): Promise<{ member: TeamMember; linkedCount: number }> {
   const idStr = String(telegramUserId);
   const { data, error } = await supabase
     .from('team_members')
@@ -197,9 +226,9 @@ export async function updateTeamMemberName(
     .eq('status', 'PENDENTE');
 
   // Vincula retroativamente processos que estavam como unassigned com esse novo apelido
-  await linkUnassignedProcessesToMember(idStr, newName);
+  const linkedCount = await linkUnassignedProcessesToMember(idStr, newName);
 
-  return data as TeamMember;
+  return { member: data as TeamMember, linkedCount };
 }
 
 export async function getTeamMember(
@@ -346,19 +375,17 @@ export async function getMyPendingProcesses(
 ): Promise<Process[]> {
   const idStr = String(ownerTelegramId);
 
-  let query = supabase
-    .from('processes')
-    .select('*')
-    .eq('status', 'PENDENTE');
-
+  // Auto-vincula prazos pendentes não atribuídos antes de listar
   if (ownerName && ownerName.trim()) {
-    const cleanName = ownerName.trim();
-    query = query.or(`owner_telegram_id.eq.${idStr},owner_name.ilike.%${cleanName}%`);
-  } else {
-    query = query.eq('owner_telegram_id', idStr);
+    await linkUnassignedProcessesToMember(idStr, ownerName);
   }
 
-  const { data, error } = await query.order('due_date', { ascending: true });
+  const { data, error } = await supabase
+    .from('processes')
+    .select('*')
+    .eq('owner_telegram_id', idStr)
+    .eq('status', 'PENDENTE')
+    .order('due_date', { ascending: true });
 
   if (error) {
     console.error('Erro ao buscar meus processos pendentes:', error);

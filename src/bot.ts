@@ -19,6 +19,8 @@ import {
   DEFAULT_OFFICE_GROUP_ID,
   getTodayDateString,
   getAllTeamMembers,
+  doPersonNamesMatch,
+  normalizePersonName,
 } from './supabase';
 import { parseDeadlineFromText, parseDeadlineFromAudio } from './ai';
 import { executeDeadlineCheck, getUrgencyBadge } from './cron';
@@ -88,14 +90,11 @@ async function resolveOwner(
   }
 
   const cleanResp = responsibleName.trim();
-  const lowerResp = cleanResp.toLowerCase();
 
   // Se o responsável indicado for o próprio criador
   if (
-    lowerResp === creator.name.toLowerCase() ||
-    lowerResp === 'eu' ||
-    lowerResp === 'mim' ||
-    lowerResp === 'meu'
+    doPersonNamesMatch(cleanResp, creator.name) ||
+    /^(eu|mim|meu|minha)$/i.test(cleanResp)
   ) {
     return creator;
   }
@@ -103,28 +102,18 @@ async function resolveOwner(
   // Busca membros da equipe já cadastrados no Supabase
   const members = await getAllTeamMembers();
 
-  // 1. Tenta correspondência exata
-  const exactMatch = members.find(
-    (m) => m.name.trim().toLowerCase() === lowerResp
-  );
-  if (exactMatch) {
-    return { id: exactMatch.telegram_user_id, name: exactMatch.name };
+  // 1. Tenta correspondência flexível entre os membros cadastrados (ex: "Carlos" bate em "Dr. Carlos Eduardo")
+  const matched = members.find((m) => doPersonNamesMatch(cleanResp, m.name));
+  if (matched) {
+    return { id: matched.telegram_user_id, name: matched.name };
   }
 
-  // 2. Tenta correspondência parcial (ex: "Alexandre" bate em "Alexandre de Lima Braga", "Marcos" em "Dr. Marcos")
-  const partialMatch = members.find((m) => {
-    const mName = m.name.trim().toLowerCase();
-    return mName.includes(lowerResp) || lowerResp.includes(mName);
-  });
-  if (partialMatch) {
-    return { id: partialMatch.telegram_user_id, name: partialMatch.name };
-  }
-
-  // 3. Se ainda não há membro registrado com esse nome no Telegram (ex: Chefe ainda não iniciou o bot),
-  // geramos um identificador provisório para não misturar com o criador no /meus, mas salvar com o nome do Chefe/Amigo
-  const unassignedId = `unassigned_${lowerResp.replace(/[^a-z0-9]/g, '_')}`;
+  // 2. Se o responsável ainda não tiver entrado no bot (ex: Chefe ou Amigo ainda não deu /start),
+  // geramos um identificador unassigned para salvar com o nome real indicado por Alexandre.
+  // Assim que ele entrar no bot e der /start ou /nome, o sistema vincula retroativamente!
+  const slug = normalizePersonName(cleanResp).replace(/[^a-z0-9]/g, '_') || 'responsavel';
   return {
-    id: unassignedId,
+    id: `unassigned_${slug}`,
     name: cleanResp,
   };
 }
@@ -276,23 +265,27 @@ bot.command('nome', async (ctx) => {
   const args = ctx.match?.trim();
   if (!args) {
     return ctx.reply(
-      '⚠️ Por favor, informe seu apelido/nome após o comando.\nExemplo: `/nome Irmão` ou `/nome Alexandre`',
+      '⚠️ Por favor, informe seu nome após o comando.\nExemplo: `/nome Marcos` ou `/nome Chefe`',
       { parse_mode: 'Markdown' }
     );
   }
 
   const userId = String(ctx.from?.id);
   try {
-    const updated = await updateTeamMemberName(userId, args);
+    const { member: updated, linkedCount } = await updateTeamMemberName(userId, args);
+    let linkedText = '';
+    if (linkedCount > 0) {
+      linkedText = `\n\n🎉 *Vinculamos ${linkedCount} prazo${linkedCount > 1 ? 's' : ''} pendente${linkedCount > 1 ? 's' : ''}* que já ${linkedCount > 1 ? 'estavam cadastrados' : 'estava cadastrado'} para você! Use \`/meus\` para visualizá-lo${linkedCount > 1 ? 's' : ''}.`;
+    }
+
     await ctx.reply(
-      `✅ Seu nome de exibição foi atualizado para: *${escapeMarkdown(updated.name)}*!\n` +
-      `Ele será usado nas listagens e notificações da equipe.`,
+      `✅ Seu nome de exibição foi atualizado para: *${escapeMarkdown(updated.name)}*!${linkedText}\n\n` +
+      `Ele será usado nas listagens, notificações privadas e avisos do escritório.`,
       { parse_mode: 'Markdown' }
     );
   } catch (err: any) {
     await ctx.reply(
-      `❌ Erro ao atualizar nome: ${err.message}\n` +
-      `Verifique se as tabelas do Supabase foram criadas via schema.sql.`
+      `❌ Erro ao atualizar nome: ${err.message}`
     );
   }
 });
