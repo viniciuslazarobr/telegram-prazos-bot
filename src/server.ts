@@ -101,6 +101,32 @@ app.get('/api/set-office-group', async (req: Request, res: Response) => {
   }
 });
 
+// Endpoint para limpar a base de dados (processos e membros) mantendo o grupo do escritório intacto
+app.all('/api/reset-database', async (_req: Request, res: Response) => {
+  try {
+    const { error: pErr } = await supabase.from('processes').delete().neq('id', 0);
+    const { error: mErr } = await supabase.from('team_members').delete().neq('telegram_user_id', '0');
+
+    if (pErr || mErr) {
+      return res.status(500).json({
+        success: false,
+        processesError: pErr?.message,
+        membersError: mErr?.message,
+      });
+    }
+
+    logEvent('database_reset', { time: new Date().toISOString() });
+
+    res.json({
+      success: true,
+      message: 'Base de dados limpa com sucesso! Processos e membros zerados para recomeçar.',
+      officeGroupPreserved: DEFAULT_OFFICE_GROUP_ID,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 /**
  * Inicia o servidor HTTP Express
  */

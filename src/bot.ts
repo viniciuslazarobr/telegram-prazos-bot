@@ -21,6 +21,7 @@ import {
   getAllTeamMembers,
   doPersonNamesMatch,
   normalizePersonName,
+  supabase,
 } from './supabase';
 import { parseDeadlineFromText, parseDeadlineFromAudio } from './ai';
 import { executeDeadlineCheck, getUrgencyBadge } from './cron';
@@ -330,6 +331,31 @@ bot.command('grupo', async (ctx) => {
       `⚠️ Nenhum Grupo Geral configurado ainda. Adicione o bot ao grupo do escritório e digite \`/definir_grupo\`.`,
       { parse_mode: 'Markdown' }
     );
+  }
+});
+
+/**
+ * /limpar_banco: Reseta a base de dados (processos e membros) mantendo o grupo do escritório
+ */
+bot.command(['limpar_banco', 'resetar_base'], async (ctx) => {
+  try {
+    const { error: pErr } = await supabase.from('processes').delete().neq('id', 0);
+    const { error: mErr } = await supabase.from('team_members').delete().neq('telegram_user_id', '0');
+
+    if (pErr || mErr) {
+      return ctx.reply(`❌ Erro ao limpar base: ${pErr?.message || mErr?.message}`);
+    }
+
+    await ctx.reply(
+      '🧹 *Base de Dados Limpa com Sucesso!*\n\n' +
+      '• Todos os prazos e testes anteriores foram excluídos.\n' +
+      '• O cadastro de membros foi zerado.\n' +
+      '• O Grupo Geral do Escritório foi preservado.\n\n' +
+      'Tudo pronto para começar do zero! Cada membro pode dar `/start` e `/nome [Nome Real]`.',
+      { parse_mode: 'Markdown' }
+    );
+  } catch (err: any) {
+    await ctx.reply(`❌ Erro ao limpar base: ${err.message}`);
   }
 });
 
