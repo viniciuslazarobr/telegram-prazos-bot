@@ -209,8 +209,7 @@ export async function updateTeamMemberName(
   const idStr = String(telegramUserId);
   const { data, error } = await supabase
     .from('team_members')
-    .update({ name: newName.trim() })
-    .eq('telegram_user_id', idStr)
+    .upsert({ telegram_user_id: idStr, name: newName.trim() }, { onConflict: 'telegram_user_id' })
     .select()
     .single();
 

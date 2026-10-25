@@ -57,6 +57,21 @@ app.get('/health', (_req: Request, res: Response) => {
 app.get('/debug', async (_req: Request, res: Response) => {
   const officeGroupChatId = await getOfficeGroupChatId();
   
+  // Garante que Alexandre esteja cadastrado caso a base tenha sido zerada
+  const { data: existingAlexandre } = await supabase
+    .from('team_members')
+    .select('*')
+    .eq('telegram_user_id', '8957853547')
+    .maybeSingle();
+
+  if (!existingAlexandre) {
+    await supabase.from('team_members').upsert({
+      telegram_user_id: '8957853547',
+      name: 'Alexandre',
+      username: null,
+    });
+  }
+
   const { data: members, error: membersError } = await supabase.from('team_members').select('*');
   const { data: processes, error: processesError } = await supabase.from('processes').select('*');
   const { data: settings, error: settingsError } = await supabase.from('app_settings').select('*');
@@ -125,6 +140,19 @@ app.all('/api/reset-database', async (_req: Request, res: Response) => {
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
+});
+
+// Endpoint para garantir o cadastro de um membro manualmente
+app.all('/api/ensure-member', async (req: Request, res: Response) => {
+  const id = req.query.id ? String(req.query.id) : '8957853547';
+  const name = req.query.name ? String(req.query.name) : 'Alexandre';
+  const { data, error } = await supabase.from('team_members').upsert({
+    telegram_user_id: id,
+    name: name,
+    username: null,
+  }).select().single();
+
+  res.json({ success: !error, member: data, error: error?.message });
 });
 
 /**
