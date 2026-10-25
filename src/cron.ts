@@ -66,13 +66,14 @@ export function getUrgencyBadge(daysRemaining: number): { label: string; tag: st
  */
 export async function executeDeadlineCheck(
   bot: Bot,
-  options: { isUrgentOnly?: boolean; manualTrigger?: boolean } = {}
+  options: { isUrgentOnly?: boolean; isTodayAndOverdueOnly?: boolean; manualTrigger?: boolean } = {}
 ): Promise<AlertExecutionResult> {
   const isUrgentOnly = !!options.isUrgentOnly;
+  const isTodayAndOverdueOnly = !!options.isTodayAndOverdueOnly;
   const isManual = !!options.manualTrigger;
 
   console.log(
-    `[CRON] Iniciando verificação de prazos (urgenteApenas=${isUrgentOnly}, manual=${isManual})...`
+    `[CRON] Iniciando verificação de prazos (hojeOuAtrasado=${isTodayAndOverdueOnly}, urgenteApenas=${isUrgentOnly}, manual=${isManual})...`
   );
 
   const pendingProcesses = await getAllPendingProcesses();
@@ -81,7 +82,11 @@ export async function executeDeadlineCheck(
   for (const proc of pendingProcesses) {
     const daysRemaining = calculateDaysRemaining(proc.due_date);
 
-    if (isUrgentOnly) {
+    if (isTodayAndOverdueOnly) {
+      if (daysRemaining <= 0) {
+        alertableProcesses.push({ process: proc, daysRemaining });
+      }
+    } else if (isUrgentOnly) {
       if (daysRemaining <= 1) {
         alertableProcesses.push({ process: proc, daysRemaining });
       }
@@ -90,6 +95,17 @@ export async function executeDeadlineCheck(
         alertableProcesses.push({ process: proc, daysRemaining });
       }
     }
+  }
+
+  // Se for a verificação de 30min e não houver nada para hoje ou atrasado, encerra em silêncio
+  if (isTodayAndOverdueOnly && alertableProcesses.length === 0) {
+    return {
+      totalProcessesChecked: pendingProcesses.length,
+      alertedCount: 0,
+      privateMessagesSent: 0,
+      groupNotified: false,
+      isUrgentOnly: false,
+    };
   }
 
   let privateMessagesSent = 0;
@@ -101,6 +117,11 @@ export async function executeDeadlineCheck(
 
     const keyboard = new InlineKeyboard().text('✅ Concluir Prazo', `done:${proc.id}`);
 
+    const footerNotice =
+      daysRemaining <= 0
+        ? '_🚨 Atenção: Este prazo vence hoje (ou está atrasado)! Notificações ativas a cada 30 minutos até ser concluído._'
+        : '_Clique abaixo quando concluir a peça/ato para parar as notificações e avisar a equipe:_';
+
     const messageText =
       `${badge.emoji} *LEMBRETE DE PRAZO PROCESSUAL*\n\n` +
       `*Status:* ${badge.label}\n` +
@@ -108,7 +129,7 @@ export async function executeDeadlineCheck(
       `👤 *Cliente:* ${escapeMarkdown(proc.client_name)}\n` +
       `⏳ *Prazo:* ${escapeMarkdown(proc.deadline_info)}\n` +
       `📅 *Vencimento:* ${formatDateBR(proc.due_date)}\n\n` +
-      `_Clique abaixo quando concluir a peça/ato para parar as notificações e avisar a equipe:_`;
+      `${footerNotice}`;
 
     try {
       if (!proc.owner_telegram_id.startsWith('unassigned_')) {
@@ -143,9 +164,12 @@ export async function executeDeadlineCheck(
       }
 
       const todayStrBR = formatDateBR(getTodayDateString());
-      const titlePrefix = isUrgentOnly
-        ? '⚡ *PAINEL DE COBRANÇA URGENTE DO ESCRITÓRIO*'
-        : '☀️ *PAINEL DO DIA DA EQUIPE - PRAZOS DO ESCRITÓRIO*';
+      let titlePrefix = '☀️ *PAINEL DO DIA DA EQUIPE - PRAZOS DO ESCRITÓRIO*';
+      if (isTodayAndOverdueOnly) {
+        titlePrefix = '⚡ *COBRANÇA AUTOMÁTICA (A CADA 30 MIN) - VENCE HOJE / ATRASADOS*';
+      } else if (isUrgentOnly) {
+        titlePrefix = '⚡ *PAINEL DE COBRANÇA URGENTE DO ESCRITÓRIO*';
+      }
 
       let groupMessage = `${titlePrefix}\n📅 Data: ${todayStrBR} | Horário de Brasília\n\n`;
 
@@ -160,7 +184,9 @@ export async function executeDeadlineCheck(
         groupMessage += '\n';
       }
 
-      groupMessage += '👉 _Cada responsável já recebeu a notificação individual no privado com botão para dar baixa!_';
+      groupMessage += isTodayAndOverdueOnly
+        ? '👉 _Lembretes a cada 30 minutos até a conclusão da tarefa. Clique no botão do privado para dar baixa!_'
+        : '👉 _Cada responsável já recebeu a notificação individual no privado com botão para dar baixa!_';
 
       try {
         await bot.api.sendMessage(officeGroupChatId, groupMessage, {
@@ -171,7 +197,7 @@ export async function executeDeadlineCheck(
         console.error('[CRON] Falha ao enviar painel no Grupo Geral do Escritório:', err?.message || err);
         logEvent('cron_group_send_error', { error: err.message, officeGroupChatId });
       }
-    } else if (!isUrgentOnly || isManual) {
+    } else if ((!isUrgentOnly && !isTodayAndOverdueOnly) || isManual) {
       const todayStrBR = formatDateBR(getTodayDateString());
       const cleanMessage =
         `☀️ *PAINEL DO ESCRITÓRIO - TUDO EM DIA!*\n📅 ${todayStrBR}\n\n` +
@@ -250,8 +276,22 @@ export function setupCronJobs(bot: Bot): void {
     { timezone }
   );
 
+  // 4. A CADA 30 MINUTOS (08:00 às 20:30): Cobrança contínua de prazos que vencem hoje ou atrasados
+  cron.schedule(
+    '0,30 8-20 * * *',
+    async () => {
+      console.log('[CRON-30MIN] Verificando prazos de hoje e atrasados...');
+      try {
+        await executeDeadlineCheck(bot, { isTodayAndOverdueOnly: true });
+      } catch (err) {
+        console.error('[CRON-30MIN] Erro na verificação de 30min:', err);
+      }
+    },
+    { timezone }
+  );
+
   console.log(`[CRON] Agendamentos configurados com sucesso no fuso horário ${timezone}:`);
-  console.log(' - 08:30: Lembretes individuais + Painel do Dia da Equipe no Grupo');
-  console.log(' - 14:00: Cobrança urgente (vence hoje, amanhã ou atrasados)');
-  console.log(' - 17:00: Cobrança urgente de fim de expediente');
+  console.log(' - 08:30: Lembretes individuais completos (3, 2, 1 dias antes + hoje + atrasados) e Painel do Grupo');
+  console.log(' - 14:00 e 17:00: Cobranças urgentes da tarde');
+  console.log(' - A cada 30 min (08h às 20h): Cobrança contínua de prazos que vencem hoje e atrasados até serem concluídos');
 }
