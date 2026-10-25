@@ -8,6 +8,7 @@ export interface ParsedDeadline {
   deadline_info: string;
   due_date: string; // YYYY-MM-DD
   remind_days_before: number;
+  responsible_name?: string; // Atribuição a colega/chefe/amigo
 }
 
 let genAI: GoogleGenerativeAI | null = null;
@@ -37,12 +38,13 @@ SUA MISSÃO:
 Extrair os seguintes campos obrigatórios com precisão:
 1. process_number: Número do processo (ex: "0012345-67.2024.8.26.0100" ou "123"). Limpe pontos finais ou caracteres extras.
 2. client_name: Nome do cliente ou partes envolvidas (ex: "Ali", "Banco do Brasil", "João da Silva").
-3. deadline_info: O que precisa ser feito / qual é o prazo (ex: "Contestação", "Vencimento às 13:30", "Réplica"). Se houver horário citado (ex: 13:30), preserve o horário na descrição!
+3. deadline_info: O que precisa ser feito / qual é o prazo (ex: "Contestação às 13:55", "Vencimento às 13:55", "Réplica"). Se houver horário citado, preserve o horário na descrição sem duplicar!
 4. due_date: Data final do vencimento no formato estrito "YYYY-MM-DD".
    - Se for "hoje", use ${dateStr}.
    - Se for "amanhã", calcule o dia seguinte a ${dateStr}.
    - Se houver data explícita (ex: 25/10/2026), converta para YYYY-MM-DD.
-5. remind_days_before: Quantos dias de antecedência começar a alertar (número inteiro). Padrão: 3. Se for hoje ou amanhã, use 1 ou 3.
+5. remind_days_before: Quantos dias de antecedência começar a alertar (número inteiro). Padrão: 3.
+6. responsible_name: Nome da pessoa responsável pelo prazo (ex: "Chefe", "Alexandre", "Amigo", "Irmão", "Dr. João"). Se citado ("para o chefe", "responsável: Amigo"), extraia aqui. Se não citado, retorne null.
 
 FORMATO DA RESPOSTA:
 Retorne APENAS um objeto JSON válido, sem blocos de markdown adicionais:
@@ -51,7 +53,8 @@ Retorne APENAS um objeto JSON válido, sem blocos de markdown adicionais:
   "client_name": "...",
   "deadline_info": "...",
   "due_date": "YYYY-MM-DD",
-  "remind_days_before": 3
+  "remind_days_before": 3,
+  "responsible_name": null
 }
 `;
 }
@@ -93,7 +96,7 @@ export async function parseDeadlineFromText(text: string): Promise<ParsedDeadlin
     }
   }
 
-  // 2. Fallback inteligente por Expressões Regulares (compreende todos os formatos estruturados e naturais)
+  // 2. Fallback inteligente por Expressões Regulares
   return fallbackRegexParser(trimmed);
 }
 
@@ -144,9 +147,6 @@ export async function parseDeadlineFromAudio(
   return null;
 }
 
-/**
- * Validação dos campos mínimos obrigatórios
- */
 function isValidParsedDeadline(item: any): boolean {
   return (
     item &&
@@ -158,24 +158,18 @@ function isValidParsedDeadline(item: any): boolean {
   );
 }
 
-/**
- * Normaliza campos retornados pelo modelo
- */
 function normalizeParsedDeadline(item: any): ParsedDeadline {
   return {
     process_number: String(item.process_number || 'A DEFINIR').replace(/[.,;:]+$/, '').trim(),
     client_name: String(item.client_name || 'Não informado').replace(/[.,;:]+$/, '').trim(),
     deadline_info: String(item.deadline_info || 'Prazo geral').trim(),
     due_date: String(item.due_date).trim(),
-    remind_days_before: typeof item.remind_days_before === 'number' && item.remind_days_before > 0
-      ? item.remind_days_before
-      : 3,
+    remind_days_before:
+      typeof item.remind_days_before === 'number' && item.remind_days_before > 0 ? item.remind_days_before : 3,
+    responsible_name: item.responsible_name ? String(item.responsible_name).replace(/[.,;:]+$/, '').trim() : undefined,
   };
 }
 
-/**
- * Limpa markdown e converte para JSON com segurança
- */
 function sanitizeAndParseJson<T>(raw: string): T | null {
   try {
     let clean = raw.trim();
@@ -191,24 +185,47 @@ function sanitizeAndParseJson<T>(raw: string): T | null {
 }
 
 /**
- * Parser de fallback via Regex para quando a IA não estiver ativa ou o usuário usar padrões simples
+ * Parser de fallback via Regex para quando a IA não estiver ativa ou o usuário usar padrões estruturados
  */
 export function fallbackRegexParser(text: string): ParsedDeadline | null {
   const clean = text.trim();
 
-  // Padrão 1: separado por pipes: Nº | Cliente | Prazo | DD/MM/AAAA [| Dias]
+  // Padrão 1: separado por pipes: Nº | Cliente | Prazo | DD/MM/AAAA [| Responsável ou Dias] [| Dias]
   if (clean.includes('|')) {
     const parts = clean.split('|').map((p) => p.trim());
     if (parts.length >= 4) {
       const isoDate = parseDateBRToISO(parts[3]);
       if (isoDate) {
-        const days = parts[4] ? parseInt(parts[4], 10) : 3;
+        let responsibleName: string | undefined = undefined;
+        let days = 3;
+
+        // Se houver 5º campo
+        if (parts[4]) {
+          const parsedNum = parseInt(parts[4], 10);
+          if (isNaN(parsedNum)) {
+            responsibleName = parts[4].replace(/[.,;:]+$/, '').trim();
+          } else {
+            days = parsedNum;
+          }
+        }
+
+        // Se houver 6º campo
+        if (parts[5]) {
+          const parsedNum = parseInt(parts[5], 10);
+          if (isNaN(parsedNum)) {
+            responsibleName = parts[5].replace(/[.,;:]+$/, '').trim();
+          } else {
+            days = parsedNum;
+          }
+        }
+
         return {
           process_number: parts[0].replace(/[.,;:]+$/, '').trim(),
           client_name: parts[1].replace(/[.,;:]+$/, '').trim(),
           deadline_info: parts[2].trim(),
           due_date: isoDate,
           remind_days_before: isNaN(days) ? 3 : days,
+          responsible_name: responsibleName,
         };
       }
     }
@@ -219,7 +236,6 @@ export function fallbackRegexParser(text: string): ParsedDeadline | null {
   const todayStr = getTodayDateString();
   const [tY, tM, tD] = todayStr.split('-').map(Number);
 
-  // Data explícita DD/MM/AAAA ou DD/MM
   const explicitDateMatch = clean.match(/(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?/);
   if (explicitDateMatch) {
     const d = explicitDateMatch[1].padStart(2, '0');
@@ -237,33 +253,49 @@ export function fallbackRegexParser(text: string): ParsedDeadline | null {
     isoDate = tm.toISOString().split('T')[0];
   }
 
-  // Extração de horário (ex: "às 13:30", "13h30", "13:30")
-  const timeMatch = clean.match(/(?:às|as)?\s*(\d{1,2})(?:[:h](\d{2}))?/i);
-  let timeStr = '';
-  if (
-    timeMatch &&
-    (clean.toLowerCase().includes('às') ||
-      clean.toLowerCase().includes('as ') ||
-      timeMatch[0].includes(':') ||
-      timeMatch[0].toLowerCase().includes('h'))
-  ) {
-    const hh = timeMatch[1].padStart(2, '0');
-    const mm = (timeMatch[2] || '00').padStart(2, '0');
-    timeStr = ` (às ${hh}:${mm})`;
+  // Extração de horário estrito
+  const timeStrictMatch =
+    clean.match(/(?:às|as)\s*(\d{1,2})(?:[:h](\d{2}))?/i) ||
+    clean.match(/(\d{1,2})[:h](\d{2})/i);
+
+  let formattedTime = '';
+  if (timeStrictMatch) {
+    const hh = timeStrictMatch[1].padStart(2, '0');
+    const mm = (timeStrictMatch[2] || '00').padStart(2, '0');
+    formattedTime = `às ${hh}:${mm}`;
   }
 
-  // Padrão 2: tags nomeadas (ex: Processo: X, Cliente: Y, Prazo: Z)
-  const procMatch = clean.match(/processo[:\s]+([^\n,;|]+)/i);
-  const cliMatch = clean.match(/cliente[:\s]+([^\n,;|]+)/i);
-  const prazoMatch = clean.match(/prazo[:\s]+([^\n,;|]+)/i);
+  // Extração de Responsável (ex: "Responsável: Chefe", "Resp: Amigo", "para o Chefe", "para Alexandre")
+  const respMatch =
+    clean.match(/(?:respons[aá]vel|resp)[:\s]+([^\n,;|]+)/i) ||
+    clean.match(/(?:atribu[ií]do|para|com)\s+(?:o|a)?\s*([A-ZÀ-ÿ][a-zà-ÿ]+(?:\s+[A-ZÀ-ÿ][a-zà-ÿ]+)?)/);
+
+  let responsibleName: string | undefined = undefined;
+  if (respMatch) {
+    responsibleName = respMatch[1].replace(/[.,;:]+$/, '').trim();
+  }
+
+  // Padrão 2: tags nomeadas com dois pontos (ex: Processo: X, Cliente: Y, Prazo: Z)
+  const procMatch = clean.match(/processo\s*:\s*([^\n,;|]+)/i);
+  const cliMatch = clean.match(/cliente\s*:\s*([^\n,;|]+)/i);
+  const prazoMatch = clean.match(/prazo\s*:\s*([^\n,;|]+)/i);
 
   if (procMatch && cliMatch && (isoDate || prazoMatch)) {
-    const rawProc = procMatch[1].replace(/[.,;:]+$/, '').trim();
+    const rawProc = procMatch[1].replace(/^[.,;:\s]+|[.,;:\s]+$/g, '').trim();
     const rawCli = cliMatch[1].replace(/[.,;:]+$/, '').trim();
     let rawPrazo = prazoMatch ? prazoMatch[1].trim() : 'Prazo processual';
 
-    if (timeStr && !rawPrazo.includes(timeStr)) {
-      rawPrazo += timeStr;
+    if (/^vence\s+/i.test(rawPrazo)) {
+      rawPrazo = rawPrazo.replace(/^vence\s+\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?\s*/i, 'Vencimento ').trim();
+    }
+
+    if (
+      formattedTime &&
+      !rawPrazo.toLowerCase().includes(formattedTime.toLowerCase()) &&
+      !rawPrazo.toLowerCase().includes('às') &&
+      !rawPrazo.toLowerCase().includes('as ')
+    ) {
+      rawPrazo += ` (${formattedTime})`;
     }
 
     return {
@@ -272,20 +304,32 @@ export function fallbackRegexParser(text: string): ParsedDeadline | null {
       deadline_info: rawPrazo,
       due_date: isoDate || todayStr,
       remind_days_before: 3,
+      responsible_name: responsibleName,
     };
   }
 
-  // Padrão 3: texto natural (ex: "Processo 123 do cliente Ali contestação vence hoje às 13:30")
+  // Padrão 3: texto natural (ex: "Processo 123 do cliente Ali para o Chefe contestação vence hoje às 13:30")
   if (isoDate) {
     const numMatch = clean.match(/(?:processo|n[ºo°]?)\s*[:.]?\s*([a-zA-Z0-9\-\.\/]+)/i);
     const clientMatch = clean.match(
-      /(?:cliente|parte|do|da)\s*[:.]?\s*([a-zA-ZÀ-ÿ\s]{2,30}?)(?=\s+(?:prazo|vence|vencimento|dia|às|com|,|$))/i
+      /(?:cliente|parte)\s*[:.]?\s*([a-zA-ZÀ-ÿ\s]{2,30}?)(?=\s+(?:para|com|prazo|tarefa|vence|vencimento|dia|às|contesta|r[eé]plica|recurso|apela|agravo|,|$))/i
     );
-    const taskMatch = clean.match(/(?:prazo|tarefa|para)\s*[:.]?\s*([^\n,;]+)/i);
+    const legalActionMatch = clean.match(
+      /(?:contesta[cç][aã]o|r[eé]plica|recurso|apela[cç][aã]o|agravo|embargos|audi[eê]ncia|manifesta[cç][aã]o|peti[cç][aã]o|memoriais|alega[cç][oõ]es)/i
+    );
+    const taskMatch = clean.match(/(?:prazo|tarefa)\s*[:.]?\s*([^\n,;]+)/i);
 
-    const proc = numMatch ? numMatch[1].replace(/[.,;:]+$/, '').trim() : '123';
-    const cli = clientMatch ? clientMatch[1].replace(/[.,;:]+$/, '').trim() : 'Cliente';
-    const task = (taskMatch ? taskMatch[1].trim() : 'Prazo processual') + timeStr;
+    const proc = numMatch ? numMatch[1].replace(/^[.,;:\s]+|[.,;:\s]+$/g, '').trim() : '123';
+    const cli = clientMatch ? clientMatch[1].replace(/^[.,;:\s]+|[.,;:\s]+$/g, '').trim() : 'Cliente';
+    let task = taskMatch
+      ? taskMatch[1].trim()
+      : legalActionMatch
+      ? legalActionMatch[0].trim()
+      : 'Prazo processual';
+
+    if (formattedTime && !task.toLowerCase().includes('às') && !task.toLowerCase().includes('as ')) {
+      task += ` (${formattedTime})`;
+    }
 
     return {
       process_number: proc,
@@ -293,6 +337,7 @@ export function fallbackRegexParser(text: string): ParsedDeadline | null {
       deadline_info: task,
       due_date: isoDate,
       remind_days_before: 3,
+      responsible_name: responsibleName,
     };
   }
 

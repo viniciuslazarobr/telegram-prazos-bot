@@ -18,6 +18,7 @@ import {
   Process,
   DEFAULT_OFFICE_GROUP_ID,
   getTodayDateString,
+  getAllTeamMembers,
 } from './supabase';
 import { parseDeadlineFromText, parseDeadlineFromAudio } from './ai';
 import { executeDeadlineCheck, getUrgencyBadge } from './cron';
@@ -76,6 +77,75 @@ async function ensureUserRegistered(ctx: any): Promise<{ id: string; name: strin
 }
 
 /**
+ * Localiza o responsável entre os membros da equipe cadastrados, ou mantém o nome especificado
+ */
+async function resolveOwner(
+  responsibleName: string | undefined | null,
+  creator: { id: string; name: string }
+): Promise<{ id: string; name: string }> {
+  if (!responsibleName || !responsibleName.trim()) {
+    return creator;
+  }
+
+  const cleanResp = responsibleName.trim();
+  const lowerResp = cleanResp.toLowerCase();
+
+  // Se o responsável indicado for o próprio criador
+  if (
+    lowerResp === creator.name.toLowerCase() ||
+    lowerResp === 'eu' ||
+    lowerResp === 'mim' ||
+    lowerResp === 'meu'
+  ) {
+    return creator;
+  }
+
+  // Busca membros da equipe já cadastrados no Supabase
+  const members = await getAllTeamMembers();
+
+  // 1. Tenta correspondência exata
+  const exactMatch = members.find(
+    (m) => m.name.trim().toLowerCase() === lowerResp
+  );
+  if (exactMatch) {
+    return { id: exactMatch.telegram_user_id, name: exactMatch.name };
+  }
+
+  // 2. Tenta correspondência parcial (ex: "Alexandre" bate em "Alexandre de Lima Braga", "Marcos" em "Dr. Marcos")
+  const partialMatch = members.find((m) => {
+    const mName = m.name.trim().toLowerCase();
+    return mName.includes(lowerResp) || lowerResp.includes(mName);
+  });
+  if (partialMatch) {
+    return { id: partialMatch.telegram_user_id, name: partialMatch.name };
+  }
+
+  // 3. Se ainda não há membro registrado com esse nome no Telegram (ex: Chefe ainda não iniciou o bot),
+  // geramos um identificador provisório para não misturar com o criador no /meus, mas salvar com o nome do Chefe/Amigo
+  const unassignedId = `unassigned_${lowerResp.replace(/[^a-z0-9]/g, '_')}`;
+  return {
+    id: unassignedId,
+    name: cleanResp,
+  };
+}
+
+/**
+ * Formata a linha de aviso de antecedência com inteligência contextual
+ */
+function formatRemindNotice(daysRemaining: number, remindDaysBefore: number): string {
+  if (daysRemaining < 0) {
+    return '🚨 *Status:* Prazo já vencido / em atraso! Cobrança ativa.';
+  }
+  if (daysRemaining === 0) {
+    return '⚡ *Status:* Prazo fatal para HOJE! Notificações ativas ao longo do dia.';
+  }
+  if (daysRemaining === 1) {
+    return '⏳ *Status:* Vence amanhã! Cobrança urgente ativa.';
+  }
+  return `🔔 *Avisos:* Começa a alertar ${remindDaysBefore} dias antes do vencimento`;
+}
+
+/**
  * Envia notificação imediata no Grupo Geral do Escritório sobre novos cadastros
  */
 async function notifyOfficeGroupNewProcess(proc: Process, creatorName: string): Promise<void> {
@@ -96,12 +166,15 @@ async function notifyOfficeGroupNewProcess(proc: Process, creatorName: string): 
     title = `⏳ *ATENÇÃO: PRAZO PARA AMANHÃ! Cadastrado por ${escapeMarkdown(creatorName)}:*`;
   }
 
+  const noticeLine = formatRemindNotice(daysRemaining, proc.remind_days_before);
+
   const msg =
     `${title}\n\n` +
     `📂 *Processo:* \`${escapeMarkdown(proc.process_number)}\`\n` +
     `👤 *Cliente:* *${escapeMarkdown(proc.client_name)}*\n` +
     `⏳ *Prazo:* _${escapeMarkdown(proc.deadline_info)}_\n` +
     `📅 *Vencimento:* *${formatDateBR(proc.due_date)}*${alertBanner}\n` +
+    `${noticeLine}\n` +
     `📌 *Responsável:* ${escapeMarkdown(proc.owner_name)}`;
 
   try {
@@ -289,7 +362,7 @@ bot.command('novo', async (ctx) => {
     );
   }
 
-  const [processNumber, clientName, deadlineInfo, dateRaw, daysRaw] = parts;
+  const [processNumber, clientName, deadlineInfo, dateRaw, part5, part6] = parts;
   const isoDate = parseDateBRToISO(dateRaw);
   if (!isoDate) {
     return ctx.reply(
@@ -298,16 +371,37 @@ bot.command('novo', async (ctx) => {
     );
   }
 
-  const remindDays = daysRaw ? parseInt(daysRaw, 10) : 3;
+  let responsibleName: string | undefined = undefined;
+  let remindDays = 3;
+
+  if (part5) {
+    const num = parseInt(part5, 10);
+    if (isNaN(num)) {
+      responsibleName = part5;
+    } else {
+      remindDays = num;
+    }
+  }
+
+  if (part6) {
+    const num = parseInt(part6, 10);
+    if (isNaN(num)) {
+      responsibleName = part6;
+    } else {
+      remindDays = num;
+    }
+  }
+
   const user = await ensureUserRegistered(ctx);
+  const owner = await resolveOwner(responsibleName, user);
 
   try {
     const process = await createProcess({
-      process_number: processNumber,
-      client_name: clientName,
-      deadline_info: deadlineInfo,
-      owner_telegram_id: user.id,
-      owner_name: user.name,
+      process_number: processNumber.replace(/[.,;:]+$/, '').trim(),
+      client_name: clientName.replace(/[.,;:]+$/, '').trim(),
+      deadline_info: deadlineInfo.trim(),
+      owner_telegram_id: owner.id,
+      owner_name: owner.name,
       due_date: isoDate,
       remind_days_before: isNaN(remindDays) ? 3 : remindDays,
     });
@@ -316,13 +410,16 @@ bot.command('novo', async (ctx) => {
       .text('✅ Concluir Prazo', `done:${process.id}`)
       .text('🗑️ Excluir', `delete:${process.id}`);
 
+    const daysRemaining = calculateDaysRemaining(process.due_date);
+    const noticeLine = formatRemindNotice(daysRemaining, process.remind_days_before);
+
     await ctx.reply(
       `✅ *Prazo Cadastrado com Sucesso!*\n\n` +
       `📂 *Processo:* \`${escapeMarkdown(process.process_number)}\`\n` +
       `👤 *Cliente:* ${escapeMarkdown(process.client_name)}\n` +
       `⏳ *Prazo:* ${escapeMarkdown(process.deadline_info)}\n` +
       `📅 *Vencimento:* ${formatDateBR(process.due_date)}\n` +
-      `🔔 *Avisar com:* ${process.remind_days_before} dias de antecedência\n` +
+      `${noticeLine}\n` +
       `📌 *Responsável:* ${escapeMarkdown(process.owner_name)}`,
       { parse_mode: 'Markdown', reply_markup: keyboard }
     );
@@ -339,7 +436,7 @@ bot.command('novo', async (ctx) => {
  */
 bot.command('meus', async (ctx) => {
   const user = await ensureUserRegistered(ctx);
-  const myProcesses = await getMyPendingProcesses(user.id);
+  const myProcesses = await getMyPendingProcesses(user.id, user.name);
 
   if (myProcesses.length === 0) {
     return ctx.reply(`🎉 *Parabéns, ${escapeMarkdown(user.name)}!*\nVocê não possui nenhum prazo pendente no momento.`, {
@@ -466,15 +563,26 @@ bot.command('ajuda', async (ctx) => {
   const helpText =
     `📖 *MANUAL DO BOT DE PRAZOS DO ESCRITÓRIO*\n\n` +
     `🤖 *1. Como Cadastrar Prazos:*\n` +
-    `• *Por Áudio:* Basta mandar uma mensagem de voz no privado ou grupo dizendo: _"Processo 12345 do cliente João da Silva, recurso vence na próxima terça"_. A IA entenderá automaticamente!\n` +
-    `• *Por Texto Livre:* Envie: _"Processo: 123 | Cliente: Silva | Prazo: Contestação às 13:30 | 25/10/2026"_\n` +
-    `• *Por Comando:* \`/novo Nº | Cliente | Prazo | DD/MM/AAAA\`\n\n` +
-    `📊 *2. Comandos de Consulta:*\n` +
-    `• \`/meus\` - Mostra os seus prazos com botões rápidos de baixa.\n` +
-    `• \`/geral\` - Painel de todos os prazos da equipe separados por pessoa.\n` +
+    `• *Por Áudio:* Mande uma mensagem de voz no privado ou grupo dizendo: _"Processo 12345 cliente Silva, contestação para o Chefe vence hoje às 17h"_. A IA entenderá tudo!\n` +
+    `• *Por Texto com Tags:*\n` +
+    `\`Processo: 123\`\n` +
+    `\`Cliente: Banco do Brasil\`\n` +
+    `\`Prazo: Contestação às 13:55\`\n` +
+    `\`Data: 25/10/2026\`\n` +
+    `\`Responsável: Chefe\` _(ou Amigo, Alexandre)_\n` +
+    `• *Por Linha Rápida (Pipes):*\n` +
+    `\`123 | Banco do Brasil | Contestação | 25/10/2026 | Chefe\`\n` +
+    `• *Por Comando:*\n` +
+    `\`/novo 123 | Cliente | Prazo | DD/MM/AAAA | Responsável\`\n\n` +
+    `👥 *2. Atribuição de Responsáveis:*\n` +
+    `• Se você cadastrar para um colega (ex: Chefe ou Amigo), o bot atribui a ele automaticamente.\n` +
+    `• Cada membro pode dar \`/nome [Apelido]\` (ex: \`/nome Chefe\`) para que o sistema vincule seus prazos ao seu Telegram!\n\n` +
+    `📊 *3. Comandos de Consulta:*\n` +
+    `• \`/meus\` - Mostra os seus próprios prazos pendentes com botões rápidos de baixa.\n` +
+    `• \`/geral\` - Painel de todos os prazos do escritório agrupados por responsável.\n` +
     `• \`/hoje\` - Mostra os prazos urgentes (hoje, amanhã e atrasados).\n\n` +
-    `⏰ *3. Horários das Notificações Automáticas:*\n` +
-    `• *08:30:* Notificação individual no privado + Painel Geral no grupo do escritório.\n` +
+    `⏰ *4. Horários das Notificações Automáticas:*\n` +
+    `• *08:30:* Notificação individual no privado de cada responsável + Painel Geral no grupo do escritório.\n` +
     `• *14:00 e 17:00:* Cobrança urgente apenas para o que vence hoje, amanhã ou atrasados.\n` +
     `• *A cada 30min:* Alertas automáticos para prazos com horário marcado do dia.`;
 
@@ -602,12 +710,14 @@ bot.on(['message:voice', 'message:audio'], async (ctx) => {
       return;
     }
 
+    const owner = await resolveOwner(parsed.responsible_name, user);
+
     const process = await createProcess({
       process_number: parsed.process_number,
       client_name: parsed.client_name,
       deadline_info: parsed.deadline_info,
-      owner_telegram_id: user.id,
-      owner_name: user.name,
+      owner_telegram_id: owner.id,
+      owner_name: owner.name,
       due_date: parsed.due_date,
       remind_days_before: parsed.remind_days_before,
     });
@@ -615,6 +725,9 @@ bot.on(['message:voice', 'message:audio'], async (ctx) => {
     const keyboard = new InlineKeyboard()
       .text('✅ Concluir Prazo', `done:${process.id}`)
       .text('🗑️ Excluir', `delete:${process.id}`);
+
+    const daysRemaining = calculateDaysRemaining(process.due_date);
+    const noticeLine = formatRemindNotice(daysRemaining, process.remind_days_before);
 
     await ctx.api.editMessageText(
       ctx.chat.id,
@@ -624,7 +737,7 @@ bot.on(['message:voice', 'message:audio'], async (ctx) => {
       `👤 *Cliente:* ${escapeMarkdown(process.client_name)}\n` +
       `⏳ *Prazo:* ${escapeMarkdown(process.deadline_info)}\n` +
       `📅 *Vencimento:* ${formatDateBR(process.due_date)}\n` +
-      `🔔 *Avisar:* ${process.remind_days_before} dias antes\n` +
+      `${noticeLine}\n` +
       `📌 *Responsável:* ${escapeMarkdown(process.owner_name)}`,
       { parse_mode: 'Markdown', reply_markup: keyboard }
     );
@@ -697,12 +810,14 @@ bot.on('message:text', async (ctx) => {
 
   if (parsed) {
     try {
+      const owner = await resolveOwner(parsed.responsible_name, user);
+
       const process = await createProcess({
         process_number: parsed.process_number,
         client_name: parsed.client_name,
         deadline_info: parsed.deadline_info,
-        owner_telegram_id: user.id,
-        owner_name: user.name,
+        owner_telegram_id: owner.id,
+        owner_name: owner.name,
         due_date: parsed.due_date,
         remind_days_before: parsed.remind_days_before,
       });
@@ -715,13 +830,15 @@ bot.on('message:text', async (ctx) => {
       const isToday = daysRemaining <= 0;
       const urgencyBadge = isToday ? ' 🚨 *[URGENTE: VENCE HOJE]*' : '';
 
+      const noticeLine = formatRemindNotice(daysRemaining, process.remind_days_before);
+
       await ctx.reply(
         `✅ *Prazo Cadastrado com Sucesso!*${urgencyBadge}\n\n` +
         `📂 *Processo:* \`${escapeMarkdown(process.process_number)}\`\n` +
         `👤 *Cliente:* ${escapeMarkdown(process.client_name)}\n` +
         `⏳ *Prazo:* ${escapeMarkdown(process.deadline_info)}\n` +
         `📅 *Vencimento:* ${formatDateBR(process.due_date)}\n` +
-        `🔔 *Avisar:* ${process.remind_days_before} dias antes\n` +
+        `${noticeLine}\n` +
         `📌 *Responsável:* ${escapeMarkdown(process.owner_name)}`,
         { parse_mode: 'Markdown', reply_markup: keyboard }
       );

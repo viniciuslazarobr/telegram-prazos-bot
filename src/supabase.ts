@@ -124,7 +124,53 @@ export async function upsertTeamMember(
   if (error) {
     throw new Error(`Falha ao registrar membro da equipe: ${error.message}`);
   }
+
+  // Vincula retroativamente prazos pendentes atribuídos com este nome
+  await linkUnassignedProcessesToMember(idStr, name);
+
   return data as TeamMember;
+}
+
+/**
+ * Vincula retroativamente prazos que foram cadastrados previamente com o nome do membro
+ */
+export async function linkUnassignedProcessesToMember(
+  telegramUserId: string | number,
+  memberName: string
+): Promise<number> {
+  try {
+    const idStr = String(telegramUserId);
+    const cleanName = memberName.trim().toLowerCase();
+    if (!cleanName) return 0;
+
+    const { data: unassigned, error: fetchErr } = await supabase
+      .from('processes')
+      .select('id, owner_name, owner_telegram_id')
+      .eq('status', 'PENDENTE')
+      .like('owner_telegram_id', 'unassigned_%');
+
+    if (fetchErr || !unassigned || unassigned.length === 0) return 0;
+
+    const toUpdateIds: number[] = [];
+    for (const proc of unassigned) {
+      const oName = (proc.owner_name || '').trim().toLowerCase();
+      if (oName === cleanName || oName.includes(cleanName) || cleanName.includes(oName)) {
+        toUpdateIds.push(proc.id);
+      }
+    }
+
+    if (toUpdateIds.length > 0) {
+      await supabase
+        .from('processes')
+        .update({ owner_telegram_id: idStr, owner_name: memberName.trim() })
+        .in('id', toUpdateIds);
+    }
+
+    return toUpdateIds.length;
+  } catch (err) {
+    console.error('Erro ao vincular prazos pendentes não atribuídos:', err);
+    return 0;
+  }
 }
 
 export async function updateTeamMemberName(
@@ -149,6 +195,9 @@ export async function updateTeamMemberName(
     .update({ owner_name: newName.trim() })
     .eq('owner_telegram_id', idStr)
     .eq('status', 'PENDENTE');
+
+  // Vincula retroativamente processos que estavam como unassigned com esse novo apelido
+  await linkUnassignedProcessesToMember(idStr, newName);
 
   return data as TeamMember;
 }
@@ -292,14 +341,24 @@ export async function getProcessById(id: number): Promise<Process | null> {
 }
 
 export async function getMyPendingProcesses(
-  ownerTelegramId: string | number
+  ownerTelegramId: string | number,
+  ownerName?: string
 ): Promise<Process[]> {
-  const { data, error } = await supabase
+  const idStr = String(ownerTelegramId);
+
+  let query = supabase
     .from('processes')
     .select('*')
-    .eq('owner_telegram_id', String(ownerTelegramId))
-    .eq('status', 'PENDENTE')
-    .order('due_date', { ascending: true });
+    .eq('status', 'PENDENTE');
+
+  if (ownerName && ownerName.trim()) {
+    const cleanName = ownerName.trim();
+    query = query.or(`owner_telegram_id.eq.${idStr},owner_name.ilike.%${cleanName}%`);
+  } else {
+    query = query.eq('owner_telegram_id', idStr);
+  }
+
+  const { data, error } = await query.order('due_date', { ascending: true });
 
   if (error) {
     console.error('Erro ao buscar meus processos pendentes:', error);

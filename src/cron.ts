@@ -111,11 +111,13 @@ export async function executeDeadlineCheck(
       `_Clique abaixo quando concluir a peça/ato para parar as notificações e avisar a equipe:_`;
 
     try {
-      await bot.api.sendMessage(proc.owner_telegram_id, messageText, {
-        parse_mode: 'Markdown',
-        reply_markup: keyboard,
-      });
-      privateMessagesSent++;
+      if (!proc.owner_telegram_id.startsWith('unassigned_')) {
+        await bot.api.sendMessage(proc.owner_telegram_id, messageText, {
+          parse_mode: 'Markdown',
+          reply_markup: keyboard,
+        });
+        privateMessagesSent++;
+      }
     } catch (err: any) {
       console.warn(
         `[CRON] Falha ao enviar lembrete privado para o usuário ${proc.owner_telegram_id} (${proc.owner_name}):`,
