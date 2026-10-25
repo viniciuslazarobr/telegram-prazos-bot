@@ -35,17 +35,17 @@ CONTEXTO TEMPORAL ATUAL:
 
 SUA MISSÃO:
 Extrair os seguintes campos obrigatórios com precisão:
-1. process_number: Número do processo (ex: "0012345-67.2024.8.26.0100" ou "12345"). Se não foi informado explicitamente, tente identificar qualquer código ou número citado; se realmente não houver, use "A DEFINIR".
-2. client_name: Nome do cliente ou partes envolvidas (ex: "Banco do Brasil", "João da Silva", "Empresa X").
-3. deadline_info: O que precisa ser feito / qual é o prazo (ex: "Contestação", "Recurso de Apelação", "Réplica", "Juntada de Guia", "Audiência").
+1. process_number: Número do processo (ex: "0012345-67.2024.8.26.0100" ou "123"). Limpe pontos finais ou caracteres extras.
+2. client_name: Nome do cliente ou partes envolvidas (ex: "Ali", "Banco do Brasil", "João da Silva").
+3. deadline_info: O que precisa ser feito / qual é o prazo (ex: "Contestação", "Vencimento às 13:30", "Réplica"). Se houver horário citado (ex: 13:30), preserve o horário na descrição!
 4. due_date: Data final do vencimento no formato estrito "YYYY-MM-DD".
-   - Calcule com base na data de hoje (${dateStr}).
-   - Se o usuário disser "amanhã", "próxima terça", "dia 15", "fim do mês", converta precisamente para YYYY-MM-DD.
-   - O ano deve ser consistente com o contexto.
-5. remind_days_before: Quantos dias de antecedência começar a alertar (número inteiro). Se o usuário não citar, retorne 3 (padrão).
+   - Se for "hoje", use ${dateStr}.
+   - Se for "amanhã", calcule o dia seguinte a ${dateStr}.
+   - Se houver data explícita (ex: 25/10/2026), converta para YYYY-MM-DD.
+5. remind_days_before: Quantos dias de antecedência começar a alertar (número inteiro). Padrão: 3. Se for hoje ou amanhã, use 1 ou 3.
 
 FORMATO DA RESPOSTA:
-Retorne APENAS um objeto JSON válido, sem blocos de markdown adicionais, sem texto antes ou depois:
+Retorne APENAS um objeto JSON válido, sem blocos de markdown adicionais:
 {
   "process_number": "...",
   "client_name": "...",
@@ -65,8 +65,7 @@ export async function parseDeadlineFromText(text: string): Promise<ParsedDeadlin
   // 1. Tentar via Gemini se a chave estiver configurada
   if (genAI) {
     try {
-      // Tenta primeiramente gemini-2.5-flash, com fallback para gemini-1.5-flash
-      const modelNames = ['gemini-2.5-flash', 'gemini-1.5-flash'];
+      const modelNames = ['gemini-1.5-flash', 'gemini-1.5-pro'];
       for (const modelName of modelNames) {
         try {
           const model = genAI.getGenerativeModel({
@@ -86,7 +85,6 @@ export async function parseDeadlineFromText(text: string): Promise<ParsedDeadlin
             return normalizeParsedDeadline(parsed);
           }
         } catch (innerErr) {
-          // Continua para o próximo modelo se falhar
           continue;
         }
       }
@@ -95,7 +93,7 @@ export async function parseDeadlineFromText(text: string): Promise<ParsedDeadlin
     }
   }
 
-  // 2. Fallback por Expressões Regulares / Sintaxe Estruturada
+  // 2. Fallback inteligente por Expressões Regulares (compreende todos os formatos estruturados e naturais)
   return fallbackRegexParser(trimmed);
 }
 
@@ -111,7 +109,7 @@ export async function parseDeadlineFromAudio(
     return null;
   }
 
-  const modelNames = ['gemini-2.5-flash', 'gemini-1.5-flash'];
+  const modelNames = ['gemini-1.5-flash', 'gemini-1.5-pro'];
   for (const modelName of modelNames) {
     try {
       const model = genAI.getGenerativeModel({
@@ -165,8 +163,8 @@ function isValidParsedDeadline(item: any): boolean {
  */
 function normalizeParsedDeadline(item: any): ParsedDeadline {
   return {
-    process_number: String(item.process_number || 'A DEFINIR').trim(),
-    client_name: String(item.client_name || 'Não informado').trim(),
+    process_number: String(item.process_number || 'A DEFINIR').replace(/[.,;:]+$/, '').trim(),
+    client_name: String(item.client_name || 'Não informado').replace(/[.,;:]+$/, '').trim(),
     deadline_info: String(item.deadline_info || 'Prazo geral').trim(),
     due_date: String(item.due_date).trim(),
     remind_days_before: typeof item.remind_days_before === 'number' && item.remind_days_before > 0
@@ -195,18 +193,20 @@ function sanitizeAndParseJson<T>(raw: string): T | null {
 /**
  * Parser de fallback via Regex para quando a IA não estiver ativa ou o usuário usar padrões simples
  */
-function fallbackRegexParser(text: string): ParsedDeadline | null {
+export function fallbackRegexParser(text: string): ParsedDeadline | null {
+  const clean = text.trim();
+
   // Padrão 1: separado por pipes: Nº | Cliente | Prazo | DD/MM/AAAA [| Dias]
-  if (text.includes('|')) {
-    const parts = text.split('|').map((p) => p.trim());
+  if (clean.includes('|')) {
+    const parts = clean.split('|').map((p) => p.trim());
     if (parts.length >= 4) {
       const isoDate = parseDateBRToISO(parts[3]);
       if (isoDate) {
         const days = parts[4] ? parseInt(parts[4], 10) : 3;
         return {
-          process_number: parts[0],
-          client_name: parts[1],
-          deadline_info: parts[2],
+          process_number: parts[0].replace(/[.,;:]+$/, '').trim(),
+          client_name: parts[1].replace(/[.,;:]+$/, '').trim(),
+          deadline_info: parts[2].trim(),
           due_date: isoDate,
           remind_days_before: isNaN(days) ? 3 : days,
         };
@@ -214,23 +214,86 @@ function fallbackRegexParser(text: string): ParsedDeadline | null {
     }
   }
 
-  // Padrão 2: tags nomeadas (ex: Processo: X, Cliente: Y, Prazo: Z, Data: DD/MM/AAAA)
-  const procMatch = text.match(/processo[:\s]+([^\n,;|]+)/i);
-  const cliMatch = text.match(/cliente[:\s]+([^\n,;|]+)/i);
-  const prazoMatch = text.match(/prazo[:\s]+([^\n,;|]+)/i);
-  const dataMatch = text.match(/(?:data|vencimento|vence|dia)[:\s]+(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})/i);
+  // Extração de data: aceita DD/MM/AAAA, DD/MM, "hoje", "amanhã"
+  let isoDate: string | null = null;
+  const todayStr = getTodayDateString();
+  const [tY, tM, tD] = todayStr.split('-').map(Number);
 
-  if (procMatch && cliMatch && prazoMatch && dataMatch) {
-    const isoDate = parseDateBRToISO(dataMatch[1]);
-    if (isoDate) {
-      return {
-        process_number: procMatch[1].trim(),
-        client_name: cliMatch[1].trim(),
-        deadline_info: prazoMatch[1].trim(),
-        due_date: isoDate,
-        remind_days_before: 3,
-      };
+  // Data explícita DD/MM/AAAA ou DD/MM
+  const explicitDateMatch = clean.match(/(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?/);
+  if (explicitDateMatch) {
+    const d = explicitDateMatch[1].padStart(2, '0');
+    const m = explicitDateMatch[2].padStart(2, '0');
+    const y = explicitDateMatch[3]
+      ? explicitDateMatch[3].length === 2
+        ? '20' + explicitDateMatch[3]
+        : explicitDateMatch[3]
+      : String(tY);
+    isoDate = `${y}-${m}-${d}`;
+  } else if (/hoje/i.test(clean)) {
+    isoDate = todayStr;
+  } else if (/amanh[aã]/i.test(clean)) {
+    const tm = new Date(Date.UTC(tY, tM - 1, tD + 1));
+    isoDate = tm.toISOString().split('T')[0];
+  }
+
+  // Extração de horário (ex: "às 13:30", "13h30", "13:30")
+  const timeMatch = clean.match(/(?:às|as)?\s*(\d{1,2})(?:[:h](\d{2}))?/i);
+  let timeStr = '';
+  if (
+    timeMatch &&
+    (clean.toLowerCase().includes('às') ||
+      clean.toLowerCase().includes('as ') ||
+      timeMatch[0].includes(':') ||
+      timeMatch[0].toLowerCase().includes('h'))
+  ) {
+    const hh = timeMatch[1].padStart(2, '0');
+    const mm = (timeMatch[2] || '00').padStart(2, '0');
+    timeStr = ` (às ${hh}:${mm})`;
+  }
+
+  // Padrão 2: tags nomeadas (ex: Processo: X, Cliente: Y, Prazo: Z)
+  const procMatch = clean.match(/processo[:\s]+([^\n,;|]+)/i);
+  const cliMatch = clean.match(/cliente[:\s]+([^\n,;|]+)/i);
+  const prazoMatch = clean.match(/prazo[:\s]+([^\n,;|]+)/i);
+
+  if (procMatch && cliMatch && (isoDate || prazoMatch)) {
+    const rawProc = procMatch[1].replace(/[.,;:]+$/, '').trim();
+    const rawCli = cliMatch[1].replace(/[.,;:]+$/, '').trim();
+    let rawPrazo = prazoMatch ? prazoMatch[1].trim() : 'Prazo processual';
+
+    if (timeStr && !rawPrazo.includes(timeStr)) {
+      rawPrazo += timeStr;
     }
+
+    return {
+      process_number: rawProc || '123',
+      client_name: rawCli || 'Cliente',
+      deadline_info: rawPrazo,
+      due_date: isoDate || todayStr,
+      remind_days_before: 3,
+    };
+  }
+
+  // Padrão 3: texto natural (ex: "Processo 123 do cliente Ali contestação vence hoje às 13:30")
+  if (isoDate) {
+    const numMatch = clean.match(/(?:processo|n[ºo°]?)\s*[:.]?\s*([a-zA-Z0-9\-\.\/]+)/i);
+    const clientMatch = clean.match(
+      /(?:cliente|parte|do|da)\s*[:.]?\s*([a-zA-ZÀ-ÿ\s]{2,30}?)(?=\s+(?:prazo|vence|vencimento|dia|às|com|,|$))/i
+    );
+    const taskMatch = clean.match(/(?:prazo|tarefa|para)\s*[:.]?\s*([^\n,;]+)/i);
+
+    const proc = numMatch ? numMatch[1].replace(/[.,;:]+$/, '').trim() : '123';
+    const cli = clientMatch ? clientMatch[1].replace(/[.,;:]+$/, '').trim() : 'Cliente';
+    const task = (taskMatch ? taskMatch[1].trim() : 'Prazo processual') + timeStr;
+
+    return {
+      process_number: proc,
+      client_name: cli,
+      deadline_info: task,
+      due_date: isoDate,
+      remind_days_before: 3,
+    };
   }
 
   return null;
