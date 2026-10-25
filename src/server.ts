@@ -4,8 +4,7 @@ import {
   getOfficeGroupChatId,
   setOfficeGroupChatId,
   getTodayDateString,
-  getAllTeamMembers,
-  getAllPendingProcesses,
+  supabase,
   DEFAULT_OFFICE_GROUP_ID,
 } from './supabase';
 
@@ -54,18 +53,29 @@ app.get('/health', (_req: Request, res: Response) => {
   });
 });
 
-// Endpoint de diagnóstico para depuração em tempo real
+// Endpoint de diagnóstico detalhado com erros do Supabase
 app.get('/debug', async (_req: Request, res: Response) => {
   const officeGroupChatId = await getOfficeGroupChatId();
-  const members = await getAllTeamMembers();
-  const pending = await getAllPendingProcesses();
+  
+  const { data: members, error: membersError } = await supabase.from('team_members').select('*');
+  const { data: processes, error: processesError } = await supabase.from('processes').select('*');
+  const { data: settings, error: settingsError } = await supabase.from('app_settings').select('*');
 
   res.json({
     officeGroupChatId: officeGroupChatId || DEFAULT_OFFICE_GROUP_ID,
     officeGroupConfigured: Boolean(officeGroupChatId),
-    membersCount: members.length,
-    members: members.map((m) => ({ id: m.telegram_user_id, name: m.name })),
-    pendingProcessesCount: pending.length,
+    supabaseStatus: {
+      url: config.supabaseUrl,
+      keyPrefix: config.supabaseServiceRoleKey?.substring(0, 15) + '...',
+      membersError: membersError ? { message: membersError.message, code: membersError.code, details: membersError.details, hint: membersError.hint } : null,
+      processesError: processesError ? { message: processesError.message, code: processesError.code, details: processesError.details, hint: processesError.hint } : null,
+      settingsError: settingsError ? { message: settingsError.message, code: settingsError.code, details: settingsError.details, hint: settingsError.hint } : null,
+    },
+    membersCount: members ? members.length : 0,
+    members: members || [],
+    processesCount: processes ? processes.length : 0,
+    processes: processes || [],
+    settingsData: settings || [],
     recentEvents,
   });
 });
