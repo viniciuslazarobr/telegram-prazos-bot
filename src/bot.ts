@@ -360,6 +360,36 @@ bot.command(['limpar_banco', 'resetar_base'], async (ctx) => {
 });
 
 /**
+ * /limpar_grupo: Apaga as últimas mensagens de teste do grupo
+ */
+bot.command(['limpar_grupo', 'limpar_mensagens'], async (ctx) => {
+  const chatType = ctx.chat?.type;
+  if (chatType !== 'group' && chatType !== 'supergroup') {
+    return ctx.reply('⚠️ Este comando deve ser executado **dentro do Grupo do Escritório**.');
+  }
+
+  const currentMsgId = ctx.message?.message_id;
+  if (!currentMsgId) return;
+
+  const ids: number[] = [];
+  for (let id = currentMsgId; id >= Math.max(1, currentMsgId - 100); id--) {
+    ids.push(id);
+  }
+
+  try {
+    await ctx.api.deleteMessages(ctx.chat.id, ids);
+  } catch (e) {
+    for (const msgId of ids) {
+      try {
+        await ctx.api.deleteMessage(ctx.chat.id, msgId);
+      } catch (err) {
+        // Ignora mensagens já deletadas
+      }
+    }
+  }
+});
+
+/**
  * /novo [Nº] | [Cliente] | [Prazo] | [DD/MM/AAAA] [| Dias]
  */
 bot.command('novo', async (ctx) => {
