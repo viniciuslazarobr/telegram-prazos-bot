@@ -68,7 +68,7 @@ export async function parseDeadlineFromText(text: string): Promise<ParsedDeadlin
   // 1. Tentar via Gemini se a chave estiver configurada
   if (genAI) {
     try {
-      const modelNames = ['gemini-1.5-flash', 'gemini-1.5-pro'];
+      const modelNames = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
       for (const modelName of modelNames) {
         try {
           const model = genAI.getGenerativeModel({
@@ -112,7 +112,7 @@ export async function parseDeadlineFromAudio(
     return null;
   }
 
-  const modelNames = ['gemini-1.5-flash', 'gemini-1.5-pro'];
+  const modelNames = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
   for (const modelName of modelNames) {
     try {
       const model = genAI.getGenerativeModel({
@@ -148,14 +148,18 @@ export async function parseDeadlineFromAudio(
 }
 
 function isValidParsedDeadline(item: any): boolean {
-  return (
-    item &&
-    typeof item.process_number === 'string' &&
-    typeof item.client_name === 'string' &&
-    typeof item.deadline_info === 'string' &&
-    typeof item.due_date === 'string' &&
-    /^\d{4}-\d{2}-\d{2}$/.test(item.due_date)
-  );
+  if (
+    !item ||
+    typeof item.process_number !== 'string' ||
+    typeof item.client_name !== 'string' ||
+    typeof item.deadline_info !== 'string' ||
+    typeof item.due_date !== 'string' ||
+    !/^\d{4}-\d{2}-\d{2}$/.test(item.due_date)
+  ) {
+    return false;
+  }
+  const [y, m, d] = item.due_date.split('-').map(Number);
+  return y >= 2000 && m >= 1 && m <= 12 && d >= 1 && d <= 31;
 }
 
 function normalizeParsedDeadline(item: any): ParsedDeadline {
@@ -185,6 +189,35 @@ function sanitizeAndParseJson<T>(raw: string): T | null {
 }
 
 /**
+ * Extrai uma data válida (DD/MM/AAAA ou DD/MM) ignorando falsos positivos de números de processo
+ */
+function extractValidDateFromText(textToSearch: string, defaultYear: number): string | null {
+  const dateRegex = /(?:^|[^\d.])(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?(?!\d)/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = dateRegex.exec(textToSearch)) !== null) {
+    const dayNum = parseInt(match[1], 10);
+    const monthNum = parseInt(match[2], 10);
+
+    if (dayNum >= 1 && dayNum <= 31 && monthNum >= 1 && monthNum <= 12) {
+      const d = String(dayNum).padStart(2, '0');
+      const m = String(monthNum).padStart(2, '0');
+      const y = match[3]
+        ? match[3].length === 2
+          ? '20' + match[3]
+          : match[3]
+        : String(defaultYear);
+
+      const yearNum = parseInt(y, 10);
+      if (yearNum >= 2020 && yearNum <= 2100) {
+        return `${y}-${m}-${d}`;
+      }
+    }
+  }
+  return null;
+}
+
+/**
  * Parser de fallback via Regex para quando a IA não estiver ativa ou o usuário usar padrões estruturados
  */
 export function fallbackRegexParser(text: string): ParsedDeadline | null {
@@ -199,7 +232,6 @@ export function fallbackRegexParser(text: string): ParsedDeadline | null {
         let responsibleName: string | undefined = undefined;
         let days = 3;
 
-        // Se houver 5º campo
         if (parts[4]) {
           const parsedNum = parseInt(parts[4], 10);
           if (isNaN(parsedNum)) {
@@ -209,7 +241,6 @@ export function fallbackRegexParser(text: string): ParsedDeadline | null {
           }
         }
 
-        // Se houver 6º campo
         if (parts[5]) {
           const parsedNum = parseInt(parts[5], 10);
           if (isNaN(parsedNum)) {
@@ -231,115 +262,19 @@ export function fallbackRegexParser(text: string): ParsedDeadline | null {
     }
   }
 
-  // Extração de data: aceita DD/MM/AAAA, DD/MM, "hoje", "amanhã"
-  let isoDate: string | null = null;
-  const todayStr = getTodayDateString();
-  const [tY, tM, tD] = todayStr.split('-').map(Number);
-
-  const explicitDateMatch = clean.match(/(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?/);
-  if (explicitDateMatch) {
-    const d = explicitDateMatch[1].padStart(2, '0');
-    const m = explicitDateMatch[2].padStart(2, '0');
-    const y = explicitDateMatch[3]
-      ? explicitDateMatch[3].length === 2
-        ? '20' + explicitDateMatch[3]
-        : explicitDateMatch[3]
-      : String(tY);
-    isoDate = `${y}-${m}-${d}`;
-  } else if (/hoje/i.test(clean)) {
-    isoDate = todayStr;
-  } else if (/amanh[aã]/i.test(clean)) {
-    const tm = new Date(Date.UTC(tY, tM - 1, tD + 1));
-    isoDate = tm.toISOString().split('T')[0];
-  }
-
-  // Extração de horário estrito
-  const timeStrictMatch =
-    clean.match(/(?:às|as)\s*(\d{1,2})(?:[:h](\d{2}))?/i) ||
-    clean.match(/(\d{1,2})[:h](\d{2})/i);
-
-  let formattedTime = '';
-  if (timeStrictMatch) {
-    const hh = timeStrictMatch[1].padStart(2, '0');
-    const mm = (timeStrictMatch[2] || '00').padStart(2, '0');
-    formattedTime = `às ${hh}:${mm}`;
-  }
-
-  // Extração de Responsável (ex: "Responsável: Chefe", "Resp: Amigo", "para o Chefe", "para Alexandre")
-  const respMatch =
-    clean.match(/(?:respons[aá]vel|resp)[:\s]+([^\n,;|]+)/i) ||
-    clean.match(/(?:atribu[ií]do|para|com)\s+(?:o|a)?\s*([A-ZÀ-ÿ][a-zà-ÿ]+(?:\s+[A-ZÀ-ÿ][a-zà-ÿ]+)?)/);
-
-  let responsibleName: string | undefined = undefined;
-  if (respMatch) {
-    responsibleName = respMatch[1].replace(/[.,;:]+$/, '').trim();
-  }
-
   // Padrão 2: tags nomeadas com dois pontos (ex: Processo: X, Cliente: Y, Prazo: Z)
   const procMatch = clean.match(/processo\s*:\s*([^\n,;|]+)/i);
   const cliMatch = clean.match(/cliente\s*:\s*([^\n,;|]+)/i);
   const prazoMatch = clean.match(/prazo\s*:\s*([^\n,;|]+)/i);
+  const dataTagMatch = clean.match(/(?:data|vencimento)\s*:\s*([^\n,;|]+)/i);
 
-  if (procMatch && cliMatch && (isoDate || prazoMatch)) {
-    const rawProc = procMatch[1].replace(/^[.,;:\s]+|[.,;:\s]+$/g, '').trim();
-    const rawCli = cliMatch[1].replace(/[.,;:]+$/, '').trim();
-    let rawPrazo = prazoMatch ? prazoMatch[1].trim() : 'Prazo processual';
+  // Removemos a linha do Processo (e números CNJ longos) antes de procurar datas e horários
+  // para que "1020.2026/0052908-9" nunca seja confundido com uma data!
+  const textWithoutProcess = clean
+    .replace(/processo\s*:\s*[^\n,;|]+/gi, '')
+    .replace(/\b\d{4,}[\.\-\/]\d+[\.\-\/\d]*\b/g, '');
 
-    if (/^vence\s+/i.test(rawPrazo)) {
-      rawPrazo = rawPrazo.replace(/^vence\s+\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?\s*/i, 'Vencimento ').trim();
-    }
-
-    if (
-      formattedTime &&
-      !rawPrazo.toLowerCase().includes(formattedTime.toLowerCase()) &&
-      !rawPrazo.toLowerCase().includes('às') &&
-      !rawPrazo.toLowerCase().includes('as ')
-    ) {
-      rawPrazo += ` (${formattedTime})`;
-    }
-
-    return {
-      process_number: rawProc || '123',
-      client_name: rawCli || 'Cliente',
-      deadline_info: rawPrazo,
-      due_date: isoDate || todayStr,
-      remind_days_before: 3,
-      responsible_name: responsibleName,
-    };
-  }
-
-  // Padrão 3: texto natural (ex: "Processo 123 do cliente Ali para o Chefe contestação vence hoje às 13:30")
-  if (isoDate) {
-    const numMatch = clean.match(/(?:processo|n[ºo°]?)\s*[:.]?\s*([a-zA-Z0-9\-\.\/]+)/i);
-    const clientMatch = clean.match(
-      /(?:cliente|parte)\s*[:.]?\s*([a-zA-ZÀ-ÿ\s]{2,30}?)(?=\s+(?:para|com|prazo|tarefa|vence|vencimento|dia|às|contesta|r[eé]plica|recurso|apela|agravo|,|$))/i
-    );
-    const legalActionMatch = clean.match(
-      /(?:contesta[cç][aã]o|r[eé]plica|recurso|apela[cç][aã]o|agravo|embargos|audi[eê]ncia|manifesta[cç][aã]o|peti[cç][aã]o|memoriais|alega[cç][oõ]es)/i
-    );
-    const taskMatch = clean.match(/(?:prazo|tarefa)\s*[:.]?\s*([^\n,;]+)/i);
-
-    const proc = numMatch ? numMatch[1].replace(/^[.,;:\s]+|[.,;:\s]+$/g, '').trim() : '123';
-    const cli = clientMatch ? clientMatch[1].replace(/^[.,;:\s]+|[.,;:\s]+$/g, '').trim() : 'Cliente';
-    let task = taskMatch
-      ? taskMatch[1].trim()
-      : legalActionMatch
-      ? legalActionMatch[0].trim()
-      : 'Prazo processual';
-
-    if (formattedTime && !task.toLowerCase().includes('às') && !task.toLowerCase().includes('as ')) {
-      task += ` (${formattedTime})`;
-    }
-
-    return {
-      process_number: proc,
-      client_name: cli,
-      deadline_info: task,
-      due_date: isoDate,
-      remind_days_before: 3,
-      responsible_name: responsibleName,
-    };
-  }
-
-  return null;
-}
+  // Extração de data: prioriza a linha Data:/Prazo:, senão busca no texto limpo (sem o nº do processo)
+  let isoDate: string | null = null;
+  const todayStr = getTodayDateString();
+  const [tY, tM, tD] = todayStr.split('-').map(
